@@ -1,0 +1,15 @@
+{
+  "//": "Copy to ~/.config/herdr-app/local.json (a real file, not linked: it stays out of this repo).",
+  "name": "Your name, for the Agents dashboard greeting",
+  "reviewers": {
+    "owner/app": { "dir": "~/code/app", "skill": "/comment-pr" }
+  },
+  "defaultReviewer": { "dir": "~", "skill": "/comment-pr-frontend" },
+  "reviewRepos": [
+    { "repo": "owner/app", "label": "app" },
+    { "repo": "owner/web", "label": "web", "onlyNeedingReview": true }
+  ],
+  "worktreeRepos": [
+    { "id": "app", "dir": "~/code/app", "gh": "owner/app" }
+  ]
+}

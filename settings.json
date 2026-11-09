@@ -1,0 +1,10 @@
+{
+  "zoom": 1,
+  "sounds": {
+    "enabled": true
+  },
+  "font_ligatures": false,
+  "telemetry": false,
+  "minimum_contrast": 1,
+  "font_size": 12
+}
