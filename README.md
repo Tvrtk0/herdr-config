@@ -17,14 +17,18 @@ My [Herdr](https://herdr.dev) setup: mods, layouts, themes and key bindings for 
 
 ## Screens
 
-Names, repos and PR titles are blurred.
+Names, repos, PR titles and chat are blurred; the PR screens show a public PR.
 
 | | |
 |---|---|
 | ![Review dashboard](docs/reviewdash.jpg) | ![News](docs/news.jpg) |
 | Review: open PRs waiting for you, and Claude reviewing them in the background | News: a weekly What's new in Claude Code, new docs pages, AI and tech headlines |
-| ![Stats](docs/stats.jpg) | |
-| Stats: the last 14 days of prompts, tokens and commits | |
+| ![Stats](docs/stats.jpg) | ![Session pane](docs/session.jpg) |
+| Stats: the last 14 days of prompts, tokens and commits | Session pane: the plan, its steps and the buttons, beside the Claude terminal |
+| ![PR description](docs/prdiff.jpg) | ![PR files](docs/prfiles.jpg) |
+| A PR read in Herdr: description, reviewers and checks (a public cli/cli PR) | Its files as a split diff, with review threads in place |
+| ![Session changes](docs/changes.jpg) | ![Keys](docs/keys.jpg) |
+| Changes: every file a session touched, in any repo, grouped by project | Keys: every binding on one sheet (⌘/) |
 
 ## Install
 
