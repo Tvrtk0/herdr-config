@@ -2,6 +2,8 @@
 
 My [Herdr](https://herdr.dev) setup: mods, layouts, themes and key bindings for working with Claude Code all day.
 
+![Agents board: every Claude session at a glance](docs/agents.jpg)
+
 ## What is in it
 
 - **Session pane** (`claude-reader`, opened as `claude-steps`): what Claude is doing beside its terminal. The plan with each step, subagents, the files changed, the previous request, and buttons for Refs, Ask, Read, Files and Changes.
@@ -12,6 +14,17 @@ My [Herdr](https://herdr.dev) setup: mods, layouts, themes and key bindings for 
 - **PR review** (`review-prs`, `pr-diff`): open PRs waiting for your review, a diff viewer, and Claude reviewing a PR beside it.
 - **Sidebar and chrome**: `my-spaces`, `my-agents`, `my-tabs`, `my-chrome`, `my-picker`, `my-menu`, `my-pane`.
 - **Layouts** `standard` and `dune`, themes, and `looks/build.py`, which draws the dune background.
+
+## Screens
+
+Names, repos and PR titles are blurred.
+
+| | |
+|---|---|
+| ![Review dashboard](docs/reviewdash.jpg) | ![News](docs/news.jpg) |
+| Review: open PRs waiting for you, and Claude reviewing them in the background | News: a weekly What's new in Claude Code, new docs pages, AI and tech headlines |
+| ![Stats](docs/stats.jpg) | |
+| Stats: the last 14 days of prompts, tokens and commits | |
 
 ## Install
 
