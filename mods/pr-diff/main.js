@@ -9,6 +9,10 @@ import { exec, hc, home, props, theme, settings, shared, setShared, focused, pan
 // and cards get a faint tint of their own, since its surface is opaque for tooltips.
 const glassy = (t) => (t.background ?? "").length === 9;
 // A color at some opacity, whether it came as #rrggbb or already #rrggbbaa.
+// Your GitHub login, to find your own review among the PR's.
+const ME = exec("gh", ["api", "user", "-q", ".login"]).then((r) => (r.code === 0 ? r.stdout.trim() : "")).catch(() => "");
+// Where your review of each PR stands, for the sidebar: { "owner/repo#123": { state, at } }.
+const MINE_KEY = "review.mine";
 const alpha = (c, a) => (c.length === 9 ? c.slice(0, 7) : c) + a;
 // "[Web] Add a drawer" -> ["Web", "Add a drawer"].
 const splitTitle = (title) => {
@@ -717,6 +721,10 @@ export default class PrDiff extends View {
     });
     this.load(cx);
     this.loadDrafts(cx);
+    ME.then((me) => { this.me = me; this.publishMine(); cx.notify(); });
+    // While a review runs or its comments are shown, GitHub's side is looked at again now and
+    // then, so a posted comment or review shows as such.
+    cx.timer.every(30000, (cx) => { if (!this.changes && (this.reviewAgent() || this.tab === "agent")) this.refreshMeta(cx); });
     // While an agent is on this PR its drafts can change; a cheap re-read when its file did.
     cx.timer.every(4000, (cx) => { if (this.reviewAgent() || this.tab === "agent") this.loadDrafts(cx); });
   }
@@ -801,7 +809,10 @@ export default class PrDiff extends View {
     setShared(POST_KEY, null);
     const message = this.postMessage(req.nums, req.mode ?? "comment", req.body ?? "");
     if (!message) return;
-    this.sendToAgent(message, () => { this.chosen.clear(); this.bodyInput.set_value(""); });
+    this.sendToAgent(message, () => {
+      this.chosen.clear(); this.bodyInput.set_value("");
+      // The agent posts in its own time; the 30-second look at GitHub (while it runs) shows it.
+    });
   }
 
   // Types into the review agent's pane and presses enter, as if typed there.
@@ -1146,6 +1157,56 @@ export default class PrDiff extends View {
     });
   }
 
+  // Your latest review on this PR, if any: { state, at }.
+  myReview() {
+    if (!this.me) return null;
+    const r = (this.info?.latestReviews ?? []).find((x) => x.author?.login === this.me);
+    return r ? { state: r.state, at: r.submittedAt } : null;
+  }
+  publishMine() {
+    if (this.changes || !this.repo || !this.number) return;
+    const mine = this.myReview();
+    const key = `${this.repo}#${this.number}`;
+    const all = shared(MINE_KEY) ?? {};
+    if ((all[key]?.state ?? null) === (mine?.state ?? null)) return;
+    const next = { ...all };
+    if (mine) next[key] = mine; else delete next[key];
+    setShared(MINE_KEY, next);
+  }
+  // The PR's reviews, comments and threads again, without the diff.
+  refreshMeta(cx) {
+    if (this.loading || this.metaLoading || !this.repo || !this.number) return;
+    this.metaLoading = true;
+    const [owner, name] = this.repo.split("/");
+    cx.spawn(async (cx) => {
+      try {
+        const [view, threads] = await Promise.all([
+          exec("gh", ["pr", "view", String(this.number), "--repo", this.repo, "--json", "title,author,headRefName,baseRefName,isDraft,state,body,reviews,comments,statusCheckRollup,latestReviews,reviewRequests,createdAt,updatedAt"]),
+          exec("gh", ["api", "graphql", "-F", `n=${this.number}`, "-f", `o=${owner}`, "-f", `r=${name}`, "-f", `query=${THREADS_QUERY}`]),
+        ]);
+        if (view.code === 0) { this.info = JSON.parse(view.stdout); this.conversation = conversationOf(this.info); this.checks = checksOf(this.info); }
+        if (threads.code === 0) { try { this.threads = parseThreads(threads.stdout); } catch {} }
+        this.publishMine();
+      } catch {}
+      this.metaLoading = false;
+      cx.notify();
+    });
+  }
+  // A small chip in the header: where your own review stands.
+  mineChip(t) {
+    const mine = this.myReview();
+    if (!mine) return div();
+    const [label, color] = { APPROVED: ["You approved", t.ansi2], CHANGES_REQUESTED: ["You requested changes", t.ansi1], COMMENTED: ["You commented", t.accent ?? t.ansi4], DISMISSED: ["Your review was dismissed", t.dim] }[mine.state] ?? [mine.state, t.dim];
+    const mins = mine.at ? Math.max(0, Math.round((Date.now() - Date.parse(mine.at)) * (1 / 60000))) : null;
+    const when = mins == null ? "" : mins < 60 ? `${Math.max(1, mins)}m ago` : mins < 2880 ? `${Math.round(mins * (1 / 60))}h ago` : `${Math.round(mins * (1 / 1440))}d ago`;
+    return h_flex().id("mine-chip").flex_none().gap(6).items_center().px(10).h(24).rounded(6).text_size(11.5).font_medium()
+      .bg(alpha(color, "1f")).border_1().border_color(alpha(color, "59")).text_color(color)
+      .tooltip(when ? `${label} ${when}` : label)
+      .child(div().size(6).rounded(3).bg(color))
+      .child(div().child(label))
+      .when(Boolean(when), (e) => e.child(div().text_size(10.5).opacity(0.75).child(when)));
+  }
+
   load(cx) {
     if (this.loading) return;
     if (this.changes) return this.loadChanges(cx);
@@ -1164,6 +1225,7 @@ export default class PrDiff extends View {
         ]);
         if (view.code === 0) this.info = JSON.parse(view.stdout);
         this.conversation = conversationOf(this.info);
+        this.publishMine();
         // Bots and minimized comments start folded.
         this.convFolded ??= new Set(this.conversation.filter((c) => c.bot || c.minimized).map((c) => c.id));
         try {
@@ -1793,7 +1855,7 @@ export default class PrDiff extends View {
     const fieldRow = (state, id, button, onSend) => h_flex().gap(8).items_center()
       // A press here is the field's: the pane's own mouse-down would take the keyboard back.
       .child(div().id(`${id}-field`).flex_1().min_w(0).h(34).px(10).flex().items_center().rounded(8).border_1().border_color(t.input).bg(cardBg(t))
-        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); state.focus(); this.typing = true; cx.notify(); })
+        .on_mouse_down("left", (_e, cx) => { state.focus(); this.typing = true; cx.notify(); })
         .child(Input.new(state).flex_1().text_size(12.5).text_color(t.foreground)))
       .child(smallButton(id, button, () => onSend()));
     const label = (text, color = t.dim) => div().text_size(11).font_semibold().text_color(color).child(text);
@@ -1926,7 +1988,7 @@ export default class PrDiff extends View {
           .child(h_flex().gap(8).items_center().child(div().child(postLabel))
             .child(div().px(4).rounded(3).text_size(10.5).when(ready, (x) => x.bg(alpha(ink, "26"))).when(!ready, (x) => x.text_color(t.dim)).child("enter")))))
       .when(mode !== "comment", (e) => e.child(div().id("dr-body-field").w_full().h(32).px(10).flex().items_center().rounded(8).border_1().border_color(t.input)
-        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.bodyInput.focus(); this.typing = true; cx.notify(); })
+        .on_mouse_down("left", (_e, cx) => { this.bodyInput.focus(); this.typing = true; cx.notify(); })
         .child(Input.new(this.bodyInput).flex_1().text_size(12.5).text_color(t.foreground))))
       .when(Boolean(this.sendError), (e) => e.child(div().px(10).py(6).rounded(6).bg(alpha(t.blocked, "1f")).text_color(t.blocked).child(`Slanje agentu nije uspjelo: ${this.sendError}`)))
       .child(h_flex().gap(14).text_size(11).text_color(t.dim)
@@ -2164,6 +2226,7 @@ export default class PrDiff extends View {
             ? svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().text_color(t.dim).spin(900)
             : button("reload", "↻", (_e, cx) => this.load(cx)))
           .child(button("gh", "GitHub ↗", () => exec("open", [this.url]).catch(() => {})))
+          .child(this.mineChip(t))
           .child(this.agentButton(t))))
       .child(h_flex().h(26).flex_none().gap(16).items_center().min_w(0).pl(46)
         .when(Boolean(ciFact), (e) => e.child(ciFact))

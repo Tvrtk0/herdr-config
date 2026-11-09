@@ -71,9 +71,10 @@
     "cmd-shift-g": "mod.open:claude-changes",
     "cmd-shift-o": "my-agents.home",
     "cmd-shift-a": "mod.open:aside",
-    "cmd-shift-e": "claude-steps:refs",
-    "cmd-shift-f": "claude-steps:files",
-    "cmd-shift-h": "claude-steps:prev"
+    "cmd-shift-e": "claude-steps.refs",
+    "cmd-shift-f": "claude-steps.files",
+    "cmd-shift-h": "claude-steps.prev",
+    "cmd-shift-n": "claude-steps.notes"
   },
   "terminal": {
     "cmd-f": "terminal.search",

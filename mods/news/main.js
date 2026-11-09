@@ -83,6 +83,10 @@ export default class News extends View {
       level: "info", timeout: 12000,
       action: { name: "my-agents.home:news" },
     });
+    // Into the sidebar bell's history as well (my-chrome).
+    const now = Date.now();
+    const list = Array.isArray(shared("notif.history")) ? shared("notif.history") : [];
+    setShared("notif.history", [{ at: now, title: fresh.length > 1 ? `${fresh.length} new pages in the Claude Code docs` : `New in Claude Code: ${fresh[0].title}`, body: fresh.map((c) => c.title).join(", "), level: "info" }, ...list].slice(0, 80));
   }
 
   onKey(e, cx) {

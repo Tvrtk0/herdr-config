@@ -4,6 +4,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, nextCommand, home } from "herdr";
+const alpha = (c, a) => ((c ?? "").length === 9 ? c.slice(0, 7) : c ?? "#888888") + a;
 
 // Moves a tab to another space (the tab menu asks through shared "tab.move"). Herdr has no
 // command for it: each terminal leaves its pane (terminal.park, the empty tab goes) and comes
@@ -468,7 +469,7 @@ export default class Agents extends View {
           .when(Boolean(a.focused), (el) => el.bg(t.selected))
           .hover((s) => s.bg(t.hover))
           .tooltip(`${label(a) || a.program?.name || a.address} · ${a.space_name ?? ""}`)
-          .on_click(() => showPane(a.pane))
+          .on_click(() => showPane(prPaneOf(a)?.pane ?? a.pane))
           .child(div().relative().size(18).flex().items_center().justify_center()
             .child(pic ?? div().size(8).rounded(4).bg(t.muted))
             .child(div().absolute().right(-6).bottom(-5).child(this.status(t, a, true))));
@@ -513,7 +514,7 @@ export default class Agents extends View {
           else if (this.hovered === a.address) this.hovered = null;
           cx.notify();
         })
-        .on_click(() => showPane(a.pane))
+        .on_click(() => showPane(prPaneOf(a)?.pane ?? a.pane))
         .when(Boolean(pic), el => el.child(div().id(`agent-fold-${a.address}`)
           .when(subs.length > 0, el => el.on_click((_e, cx) => {
             cx.stop_propagation();
@@ -527,15 +528,19 @@ export default class Agents extends View {
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
+        // A review session: the row opens its PR; this chip says where your own review stands
+        // (pr-diff keeps it in shared "review.mine") and opens the agent instead.
         .when(Boolean(prPaneOf(a)), (el) => {
-          const pr = prPaneOf(a);
-          const prShown = pr.zoomed || (pr.focused && !panes().some((p) => p.tab === a.tab && p.zoomed));
-          return el.child(div().id(`ag-pr-${a.address}`).flex_none().px(6).h(18).flex().items_center().rounded(5).text_size(10.5).font_semibold()
-            .when(prShown, (x) => x.bg(t.accent).text_color(t.accent_foreground))
-            .when(!prShown, (x) => x.border_1().border_color(t.border).text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground)))
-            .tooltip("Show the PR (the row shows the agent)")
-            .on_click((_e, cx) => { cx.stop_propagation(); showPane(pr.pane); })
-            .child("PR"));
+          const num = ((a.tab_name ?? "").match(/#(\d+)/) ?? [])[1];
+          const mine = Object.entries(shared("review.mine") ?? {}).find(([k]) => num && k.endsWith(`#${num}`))?.[1];
+          const look = { APPROVED: ["Approved", t.ansi2], CHANGES_REQUESTED: ["Changes", t.ansi1], COMMENTED: ["Commented", t.accent ?? t.ansi4] }[mine?.state] ?? null;
+          return el.child(div().id(`ag-pr-${a.address}`).flex_none().px(6).h(18).flex().items_center().rounded(5).text_size(10.5).font_semibold().cursor_pointer()
+            .when(Boolean(look), (x) => x.bg(alpha(look[1], "26")).text_color(look[1]))
+            .when(!look, (x) => x.border_1().border_color(t.border).text_color(t.dim))
+            .hover((s) => s.opacity(0.85))
+            .tooltip(look ? `You ${look[0].toLowerCase() === "changes" ? "requested changes" : look[0].toLowerCase()} · click for the agent` : "Not reviewed by you yet · click for the agent")
+            .on_click((_e, cx) => { cx.stop_propagation(); showPane(a.pane); })
+            .child(look ? look[0] : "To review"));
         })
         .child(this.status(t, a, byPriority && !isPinned));
     };

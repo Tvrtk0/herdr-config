@@ -15,7 +15,7 @@ const WORDS = {
   "agent.next": "Next agent", "agent.prev": "Previous agent", "layout.switch": "Switch layout", "layout.toggle:sidebar": "Toggle sidebar",
   "pane.split:right": "Split right", "pane.split:down": "Split down", "pane.close": "Close pane", "pane.zoom": "Zoom pane",
   "mod.open:my-picker": "Picker", "mod.open:claude-reading": "Reading mode", "mod.open:claude-changes": "Session changes",
-  "mod.open:keys-help": "This sheet", "mod.open:aside": "Aside: ask about the session", "claude-steps:prev": "Previous request, open / closed", "claude-steps:refs": "Refs: links, paths and commands from the chat", "claude-steps:files": "Files panel on / off", "mod.open:pregled": "Overview (as a popup)",
+  "mod.open:keys-help": "This sheet", "mod.open:aside": "Aside: ask about the session", "claude-steps.notes": "Notes: quick notes for this session", "claude-steps.prev": "Previous request, open / closed", "claude-steps.refs": "Refs: links, paths and commands from the chat", "claude-steps.files": "Files panel on / off", "mod.open:pregled": "Overview (as a popup)",
   "my-agents.steps": "Session pane on / off", "my-agents.home": "Home dashboards", "review-prs.swap": "PR ⇄ its Claude",
   "terminal.search": "Find", "terminal.copy": "Copy", "terminal.paste": "Paste", "terminal.paste_image": "Paste image",
 };

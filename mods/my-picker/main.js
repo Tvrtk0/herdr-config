@@ -61,7 +61,7 @@ function fuzzy(q, text) {
 }
 
 // What the list shows: every tab, tabs with an agent, or the review queue.
-const SCOPES = [["all", "All"], ["agents", "Agents"], ["review", "Review"], ["themes", "Themes"]];
+const SCOPES = [["all", "All"], ["agents", "Agents"], ["review", "Review"]];
 const URGENT = { blocked: 0, done: 1, working: 2, idle: 3 };
 // review-prs keeps the queue here and opens a PR's tab on "review-prs.open".
 const PRS_KEY = "review.prs", OPEN_KEY = "review.open";
@@ -99,7 +99,9 @@ export default class Picker extends View {
   init(_props, cx) {
     // Tab and shift-tab step the scope. As plain keys they never reach the picker: the search
     // field takes Tab first (focus moves on), so they are bound as actions in its context.
-    try {
+    // Installed once per app run: the keymap is the app's, and every open would add them again.
+    if (!globalThis.__myPickerKeys) try {
+      globalThis.__myPickerKeys = true;
       cx.bind_keys([
         { keystroke: "tab", action: "my_picker_next_scope", context: "MyPicker" },
         { keystroke: "shift-tab", action: "my_picker_prev_scope", context: "MyPicker" },

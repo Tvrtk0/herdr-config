@@ -129,7 +129,7 @@ export default class Aside extends View {
   }
 
   copy(text, key, cx) {
-    exec("zsh", ["-c", 'printf %s "$1" | pbcopy', "zsh", text]).catch(() => {});
+    exec("zsh", ["-c", 'printf %s "$1" | LANG=en_US.UTF-8 pbcopy', "zsh", text]).catch(() => {});
     this.copied = key;
     cx.timer.after(1500, (cx) => { if (this.copied === key) { this.copied = null; cx.notify(); } });
   }

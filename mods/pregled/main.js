@@ -314,7 +314,7 @@ export default class Overview extends View {
     const firstLive = zones.flatMap((z) => z[3])[0] ?? sleeping[0];
     const picked = live.find((a) => a.address === this.hovered) ?? firstLive;
 
-    const bubble = (a, k, small) => {
+    const bubble = (a, k, small, label) => {
       const x = info.get(a.address) ?? {};
       const st = a.status;
       const color = st === "blocked" ? t.blocked : st === "working" ? t.working : st === "done" ? t.ansi2 : t.dim;
@@ -355,20 +355,35 @@ export default class Overview extends View {
           .when(ctxHot && !small, (e) => e.child(div().absolute().top(half - size / 2 - 6 - lift).left(half + size / 2 - 22).px(5).h(16).rounded(8)
             .flex().items_center().bg(t.ansi1).text_size(10).font_semibold().text_color(t.popover).child(`${Math.round(x.ctx)}%`))))
         .child(div().w_full().h(small ? 16 : 36).overflow_hidden().px(2).text_size(small ? 10.5 : 12).text_center()
-          .text_color(on ? t.foreground : quiet ? t.dim : t.muted).child(nameOf(a)));
+          .text_color(on ? t.foreground : quiet ? t.dim : t.muted).child(label ?? nameOf(a)));
     };
 
     const emptyLine = { blocked: "Nothing waiting on you", working: "Nothing running", done: "Nothing new", idle: "No quiet sessions" };
     // Zones keep their width whatever they hold (one share, two for a crowded one), so the
     // board does not shift as sessions come and go.
-    const zoneBox = ([key, title, color, list]) => v_flex().id(`ov-z-${key}`).flex_grow(list.length > 2 ? 2 : 1).flex_basis(0).min_w(130).gap(10).p(12).rounded(12)
-      .bg(list.length ? alpha(color, "08") : "#00000000").border_1().border_color(list.length ? alpha(color, "2e") : alpha(t.foreground, "0d"))
+    // PR reviews (the review space, or a session named after a PR) gather in one block per
+    // zone as small bubbles named by their number, so a dozen of them do not bury the rest.
+    const prOf = (a) => (nameOf(a).match(/#(\d+)/) ?? (a.tab_name ?? "").match(/#(\d+)/) ?? [])[1] ?? null;
+    const isReview = (a) => (a.space_name ?? "").toLowerCase() === "review" || /\bPR\b/i.test(nameOf(a));
+    const reviewBlock = (key, color, list) => v_flex().id(`ov-rv-${key}`).w_full().gap(6).p(8).rounded(10)
+      .bg(alpha(color, "0a")).border_1().border_color(alpha(color, "24"))
+      .child(h_flex().gap(6).items_center().text_size(11)
+        .child(div().font_semibold().text_color(t.muted).child("PR reviews"))
+        .child(div().text_color(t.dim).child(String(list.length))))
+      .child(h_flex().flex_wrap().gap(2).justify_center().children(list.map((a, k) => bubble(a, k, true, prOf(a) ? `#${prOf(a)}` : nameOf(a)))));
+    const zoneBox = ([key, title, color, all]) => {
+      const reviews = all.filter(isReview), list = all.filter((a) => !isReview(a));
+      return zoneInner([key, title, color, list, reviews, all.length]);
+    };
+    const zoneInner = ([key, title, color, list, reviews, total]) => v_flex().id(`ov-z-${key}`).flex_grow(list.length + (reviews.length ? 1 : 0) > 2 ? 2 : 1).flex_basis(0).min_w(130).gap(10).p(12).rounded(12)
+      .bg(total ? alpha(color, "08") : "#00000000").border_1().border_color(total ? alpha(color, "2e") : alpha(t.foreground, "0d"))
       .child(h_flex().gap(6).items_center()
         .child(div().size(7).rounded(4).bg(color))
-        .child(div().text_size(11.5).font_semibold().text_color(list.length ? color : t.dim).child(title))
-        .child(div().text_size(11).text_color(t.dim).child(String(list.length))))
-      .child(h_flex().flex_wrap().gap(4).justify_center().children(list.map((a, k) => bubble(a, k, false))))
-      .when(!list.length, (e) => e.child(v_flex().flex_1().items_center().justify_center().gap(6).py(18)
+        .child(div().text_size(11.5).font_semibold().text_color(total ? color : t.dim).child(title))
+        .child(div().text_size(11).text_color(t.dim).child(String(total))))
+      .when(list.length > 0, (e) => e.child(h_flex().flex_wrap().gap(4).justify_center().children(list.map((a, k) => bubble(a, k, false)))))
+      .when(reviews.length > 0, (e) => e.child(reviewBlock(key, color, reviews)))
+      .when(!total, (e) => e.child(v_flex().flex_1().items_center().justify_center().gap(6).py(18)
         .child(div().size(34).rounded(17).border_1().border_color(alpha(t.foreground, "14")))
         .child(div().text_size(11.5).text_color(alpha(t.foreground, "59")).text_center().child(emptyLine[key]))));
     const board = v_flex().id("ov-board").flex_grow(3).flex_basis(0).min_w(0).gap(10)
@@ -376,7 +391,7 @@ export default class Overview extends View {
       .when(sleeping.length > 0, (e) => e.child(v_flex().gap(6).px(12).py(10).rounded(12).border_1().border_color(alpha(t.foreground, "0d"))
         .child(h_flex().gap(6).items_center().child(div().text_size(11.5).font_semibold().text_color(t.dim).child("Asleep"))
           .child(div().text_size(11).text_color(t.dim).child(`${sleeping.length} · quiet for over 12 h`)))
-        .child(h_flex().flex_wrap().gap(2).children(sleeping.map((a, k) => bubble(a, k, true))))));
+        .child(h_flex().flex_wrap().gap(2).children(sleeping.map((a, k) => bubble(a, k, true, isReview(a) && prOf(a) ? `PR #${prOf(a)}` : undefined))))));
 
     // The card for the bubble under the pointer: only what helps decide what to do next.
     const card = (a) => {

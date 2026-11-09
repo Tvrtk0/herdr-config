@@ -192,7 +192,28 @@ function pieces(text) {
     last = m.index + m[0].length;
   }
   if (last < text.length) out.push({ code: false, text: text.slice(last) });
-  return out.filter((p) => p.text.trim());
+  // A quoted block (lines starting with >) is a piece of its own too: it is usually something
+  // written for you to paste somewhere, so it gets a copy button like code.
+  const split = [];
+  for (const p of out) {
+    if (p.code) { split.push(p); continue; }
+    let prose = [], quote = [];
+    const flush = () => {
+      if (prose.length) split.push({ code: false, text: prose.join("\n") });
+      if (quote.length) split.push({ code: false, quote: true, text: quote.join("\n"), body: quote.map((l) => l.replace(/^\s*>\s?/, "")).join("\n").trim()
+        // Copied as plain text, ready to paste: no backticks or bold markers.
+        .replace(/\x60([^\x60\n]*)\x60/g, "$1").replace(/\*\*([^*\n]+)\*\*/g, "$1") });
+      prose = []; quote = [];
+    };
+    for (const line of p.text.split("\n")) {
+      const q = /^\s*>/.test(line);
+      if (q && prose.length) { split.push({ code: false, text: prose.join("\n") }); prose = []; }
+      if (!q && quote.length) flush();
+      (q ? quote : prose).push(line);
+    }
+    flush();
+  }
+  return split.filter((p) => p.text.trim());
 }
 
 // Things worth copying out of the conversation: links (GitHub PRs and commits named as such),
@@ -244,6 +265,202 @@ function refsOf(entries) {
   return out;
 }
 
+// A small vim for the Session pane's notes: normal and insert mode over plain lines.
+// Pure state and keys, nothing drawn here, so it can be tested on its own.
+//
+// Normal: h j k l (and arrows), w b e, 0 ^ $, gg G, i a I A o O, x X, dd D cc C yy, p P,
+// r<char>, J, u, ctrl-r. Insert: typing, enter, backspace, delete, tab, arrows, esc.
+
+function vimNew(text = "") {
+  return { lines: text.split("\n"), row: 0, col: 0, mode: "normal", pending: "", yank: null, undo: [], redo: [] };
+}
+
+const vimText = (v) => v.lines.join("\n");
+
+const isWord = (c) => /[\p{L}\p{N}_]/u.test(c ?? "");
+const clampCol = (v) => {
+  const len = v.lines[v.row].length;
+  v.col = Math.max(0, Math.min(v.col, v.mode === "insert" ? len : Math.max(0, len - 1)));
+};
+const snap = (v) => {
+  v.undo.push({ lines: v.lines.slice(), row: v.row, col: v.col });
+  if (v.undo.length > 200) v.undo.shift();
+  v.redo = [];
+};
+
+// The next word start after (row, col), across lines.
+function wordForward(v) {
+  let { row, col } = v;
+  let line = v.lines[row];
+  const startWord = isWord(line[col]);
+  const startSpace = /\s/.test(line[col] ?? " ");
+  if (!startSpace) while (col < line.length && isWord(line[col]) === startWord && !/\s/.test(line[col])) col++;
+  for (;;) {
+    while (col < line.length && /\s/.test(line[col])) col++;
+    if (col < line.length || row === v.lines.length - 1) break;
+    row++; col = 0; line = v.lines[row];
+    if (!line.length) break;
+  }
+  v.row = row; v.col = col;
+}
+
+function wordBack(v) {
+  let { row, col } = v;
+  let line = v.lines[row];
+  col--;
+  for (;;) {
+    while (col >= 0 && /\s/.test(line[col])) col--;
+    if (col >= 0 || row === 0) break;
+    row--; line = v.lines[row]; col = line.length - 1;
+  }
+  if (col < 0) { v.row = row; v.col = 0; return; }
+  const w = isWord(line[col]);
+  while (col > 0 && isWord(line[col - 1]) === w && !/\s/.test(line[col - 1])) col--;
+  v.row = row; v.col = col;
+}
+
+function wordEnd(v) {
+  let { row, col } = v;
+  let line = v.lines[row];
+  col++;
+  for (;;) {
+    while (col < line.length && /\s/.test(line[col])) col++;
+    if (col < line.length || row === v.lines.length - 1) break;
+    row++; col = 0; line = v.lines[row];
+  }
+  const w = isWord(line[col]);
+  while (col < line.length - 1 && isWord(line[col + 1]) === w && !/\s/.test(line[col + 1])) col++;
+  v.row = row; v.col = Math.min(col, Math.max(0, line.length - 1));
+}
+
+// One key. `key` is the key's name ("escape", "enter", "left", "a", ...), `ch` the character
+// it types (key_char), `mods` its modifiers. Returns true when the text changed.
+function vimKey(v, key, ch, mods = {}) {
+  const line = () => v.lines[v.row];
+  if (v.mode === "insert") {
+    if (key === "escape") { v.mode = "normal"; v.col = Math.max(0, v.col - 1); clampCol(v); return false; }
+    if (key === "left") { v.col = Math.max(0, v.col - 1); return false; }
+    if (key === "right") { v.col = Math.min(line().length, v.col + 1); return false; }
+    if (key === "up") { if (v.row > 0) v.row--; clampCol(v); return false; }
+    if (key === "down") { if (v.row < v.lines.length - 1) v.row++; clampCol(v); return false; }
+    if (key === "enter") {
+      const l = line();
+      v.lines.splice(v.row, 1, l.slice(0, v.col), l.slice(v.col));
+      v.row++; v.col = 0; return true;
+    }
+    if (key === "backspace") {
+      if (v.col > 0) { const l = line(); v.lines[v.row] = l.slice(0, v.col - 1) + l.slice(v.col); v.col--; return true; }
+      if (v.row > 0) { const prev = v.lines[v.row - 1]; v.lines.splice(v.row - 1, 2, prev + line()); v.row--; v.col = prev.length; return true; }
+      return false;
+    }
+    if (key === "delete") {
+      const l = line();
+      if (v.col < l.length) { v.lines[v.row] = l.slice(0, v.col) + l.slice(v.col + 1); return true; }
+      if (v.row < v.lines.length - 1) { v.lines.splice(v.row, 2, l + v.lines[v.row + 1]); return true; }
+      return false;
+    }
+    if (key === "tab") ch = "  ";
+    if (ch && !mods.control && !mods.platform) { vimInsert(v, ch); return true; }
+    return false;
+  }
+
+  // Normal mode.
+  if (key === "escape") { v.pending = ""; return false; }
+  const p = v.pending;
+  v.pending = "";
+  if (p === "r") {
+    if (ch && line().length) { snap(v); const l = line(); v.lines[v.row] = l.slice(0, v.col) + ch + l.slice(v.col + 1); return true; }
+    return false;
+  }
+  const c = mods.control && !mods.platform ? `ctrl-${key}` : ch || key;
+  if (p === "g") { if (c === "g") { v.row = 0; v.col = 0; } return false; }
+  if (p === "d" || p === "c" || p === "y") {
+    if (c !== p) return false;
+    v.yank = { line: true, text: line() };
+    if (p === "y") return false;
+    snap(v);
+    if (p === "c") { v.lines[v.row] = ""; v.col = 0; v.mode = "insert"; return true; }
+    if (v.lines.length > 1) v.lines.splice(v.row, 1); else v.lines[0] = "";
+    v.row = Math.min(v.row, v.lines.length - 1); v.col = 0; clampCol(v);
+    return true;
+  }
+  switch (c) {
+    case "h": case "left": v.col = Math.max(0, v.col - 1); return false;
+    case "l": case "right": v.col++; clampCol(v); return false;
+    case "k": case "up": if (v.row > 0) v.row--; clampCol(v); return false;
+    case "j": case "down": if (v.row < v.lines.length - 1) v.row++; clampCol(v); return false;
+    case "w": wordForward(v); clampCol(v); return false;
+    case "b": wordBack(v); return false;
+    case "e": wordEnd(v); return false;
+    case "0": v.col = 0; return false;
+    case "^": v.col = Math.max(0, line().search(/\S|$/)); clampCol(v); return false;
+    case "$": v.col = line().length; clampCol(v); return false;
+    case "G": v.row = v.lines.length - 1; v.col = 0; return false;
+    case "g": case "d": case "c": case "y": case "r": v.pending = c; return false;
+    case "i": snap(v); v.mode = "insert"; return false;
+    case "a": snap(v); v.mode = "insert"; v.col = Math.min(line().length, v.col + 1); return false;
+    case "I": snap(v); v.mode = "insert"; v.col = line().search(/\S|$/); return false;
+    case "A": snap(v); v.mode = "insert"; v.col = line().length; return false;
+    case "o": snap(v); v.lines.splice(v.row + 1, 0, ""); v.row++; v.col = 0; v.mode = "insert"; return true;
+    case "O": snap(v); v.lines.splice(v.row, 0, ""); v.col = 0; v.mode = "insert"; return true;
+    case "x": {
+      const l = line(); if (!l.length) return false;
+      snap(v); v.yank = { line: false, text: l[v.col] };
+      v.lines[v.row] = l.slice(0, v.col) + l.slice(v.col + 1); clampCol(v); return true;
+    }
+    case "X": {
+      if (v.col === 0) return false;
+      const l = line(); snap(v); v.yank = { line: false, text: l[v.col - 1] };
+      v.lines[v.row] = l.slice(0, v.col - 1) + l.slice(v.col); v.col--; return true;
+    }
+    case "D": case "C": {
+      const l = line(); snap(v); v.yank = { line: false, text: l.slice(v.col) };
+      v.lines[v.row] = l.slice(0, v.col);
+      if (c === "C") v.mode = "insert"; else clampCol(v);
+      return true;
+    }
+    case "J": {
+      if (v.row >= v.lines.length - 1) return false;
+      snap(v); const a = line().replace(/\s+$/, ""), b = v.lines[v.row + 1].replace(/^\s+/, "");
+      v.lines.splice(v.row, 2, b ? `${a} ${b}` : a); v.col = a.length; clampCol(v); return true;
+    }
+    case "p": case "P": {
+      if (!v.yank) return false;
+      snap(v);
+      if (v.yank.line) {
+        const at = c === "p" ? v.row + 1 : v.row;
+        v.lines.splice(at, 0, v.yank.text); v.row = at; v.col = 0;
+      } else {
+        const l = line(), at = c === "p" && l.length ? v.col + 1 : v.col;
+        v.lines[v.row] = l.slice(0, at) + v.yank.text + l.slice(at); v.col = at + v.yank.text.length - 1;
+      }
+      clampCol(v); return true;
+    }
+    case "u": {
+      const s = v.undo.pop(); if (!s) return false;
+      v.redo.push({ lines: v.lines.slice(), row: v.row, col: v.col });
+      Object.assign(v, { lines: s.lines, row: s.row, col: s.col }); clampCol(v); return true;
+    }
+    case "ctrl-r": {
+      const s = v.redo.pop(); if (!s) return false;
+      v.undo.push({ lines: v.lines.slice(), row: v.row, col: v.col });
+      Object.assign(v, { lines: s.lines, row: s.row, col: s.col }); clampCol(v); return true;
+    }
+  }
+  return false;
+}
+
+// Text typed or pasted at the cursor, in insert mode.
+function vimInsert(v, text) {
+  const parts = text.replace(/\r\n?/g, "\n").split("\n");
+  const l = v.lines[v.row], before = l.slice(0, v.col), after = l.slice(v.col);
+  if (parts.length === 1) { v.lines[v.row] = before + text + after; v.col += text.length; return; }
+  const middle = parts.slice(1, -1);
+  const last = parts.at(-1);
+  v.lines.splice(v.row, 1, before + parts[0], ...middle, last + after);
+  v.row += parts.length - 1; v.col = last.length;
+}
+
 export default class ClaudeReader extends View {
   init(_props, cx) {
     this.entries = [];
@@ -259,11 +476,14 @@ export default class ClaudeReader extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        if (c === "focus") this.handle.focus();
+        // pane.go (or a popup closing) lands here: the notes take the keys when they are open
+        // in the side pane, else the pane itself.
+        if (c === "focus") { if (this.notesOpen && (props()?.part ?? "both") !== "chat") this.nvHandle.focus(); else this.handle.focus(); }
         // From keys.json (claude-steps:refs, claude-steps:files): the footer's buttons by key.
-        if (c === "refs") this.refsOpen = !this.refsOpen;
+        if (c === "refs") { this.refsOpen = !this.refsOpen; if (this.refsOpen) this.notesOpen = false; }
         if (c === "prev") this.prevOpen = !this.prevOpen;
         if (c === "files") this.toggleFiles();
+        if (c === "notes") { this.notesOpen = !this.notesOpen; if (this.notesOpen) { this.refsOpen = false; this.focusNotes(cx); } }
         cx.notify();
       }
     });
@@ -277,6 +497,10 @@ export default class ClaudeReader extends View {
     // still in view is written again on the next read.
     exec("find", [`${appHome()}/pr-images/reader`, "-type", "f", "-mtime", "+3", "-delete"]).catch(() => {});
     this.diffs = {};
+    // Quick notes for this session, edited with a small vim (see vimKey), saved as you type
+    // to ~/.claude/state/notes/<session id>.md (read again when the session changes).
+    this.nv = vimNew("");
+    this.nvHandle = cx.focus_handle();
   }
 
   // A changed file's diff, from git in the file's folder (an untracked file against nothing).
@@ -327,10 +551,13 @@ export default class ClaudeReader extends View {
     cx.spawn(async (cx) => {
       try {
         if (!this.file) { this.file = await this.findFile(); force = true; }
+        if (this.file) await this.loadNotes(cx);
         if (this.file) {
           const sid = this.file.split("/").pop().replace(/\.jsonl$/, "");
           this.line = JSON.parse((await readTextFile(`${home()}/.claude/state/statusline/${sid}.json`)) ?? "null");
           this.ask = JSON.parse((await readTextFile(`${home()}/.claude/state/ask-mode/${this.terminal()}.json`)) ?? "null");
+          // Prompts waiting in the prompt-queue mod (Claude Code), sent one by one as turns end.
+          this.queued = JSON.parse((await readTextFile(`${home()}/.claude/state/queue/${this.terminal()}.json`)) ?? "null");
           const st = await exec("stat", ["-f", "%m %z", this.file]);
           const stamp = st.stdout.trim();
           if (force || stamp !== this.stamp) {
@@ -442,7 +669,7 @@ export default class ClaudeReader extends View {
   }
 
   copy(text, key, cx) {
-    exec("zsh", ["-c", 'printf %s "$1" | pbcopy', "zsh", text]).catch(() => {});
+    exec("zsh", ["-c", 'printf %s "$1" | LANG=en_US.UTF-8 pbcopy', "zsh", text]).catch(() => {});
     this.copied = key;
     cx.timer.after(1500, (cx) => { if (this.copied === key) { this.copied = null; cx.notify(); } });
   }
@@ -452,9 +679,10 @@ export default class ClaudeReader extends View {
     return v_flex().w_full().gap(10).text_size(14).text_color(t.foreground)
       .children(pieces(x.text).map((p, i) => {
         const key = `${x.id}-${i}`;
-        if (!p.code) return link(TextView.markdown(`rd-${key}`, p.text).selectable(true));
+        if (!p.code && !p.quote) return link(TextView.markdown(`rd-${key}`, p.text).selectable(true));
         return div().w_full().relative()
-          .child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true)))
+          // A quote keeps clear of the button on its right.
+          .child(div().w_full().when(Boolean(p.quote), (q) => q.pr(70)).child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true))))
           .child(div().id(`rd-copy-${key}`).absolute().top(8).right(8).px(8).h(22).flex().items_center().rounded(6)
             .bg(t.popover).border_1().border_color(t.border).text_size(11).text_color(this.copied === key ? t.ansi2 : t.muted)
             .cursor_pointer().hover((s) => s.text_color(t.foreground))
@@ -582,6 +810,54 @@ export default class ClaudeReader extends View {
   // produced, the active one with the tool running under it), and once it is finished a card
   // of what was done, whether it was tested, what is left for you and the files changed.
   // Without a plan (a short request) the turn's tools stand in for it.
+  notesPath() {
+    const id = (this.file ?? "").split("/").pop()?.replace(/\.jsonl$/, "");
+    return id ? `${home()}/.claude/state/notes/${id}.md` : null;
+  }
+  // The notes of the session now shown, once per session.
+  async loadNotes(cx) {
+    const path = this.notesPath();
+    if (!path || path === this.notesFor) return;
+    this.notesFor = path;
+    const text = (await readTextFile(path)) ?? "";
+    this.notesText = text;
+    this.nv = vimNew(text);
+    cx.notify();
+  }
+  focusNotes(cx) {
+    cx.timer.after(30, (cx) => { this.nvHandle.focus(); cx.notify(); });
+  }
+  // A key in the notes: vim's, or ⌘V to paste while inserting.
+  notesKey(e, cx) {
+    const m = e.modifiers ?? {};
+    if (m.platform) {
+      if (e.key === "v" && this.nv.mode === "insert") {
+        cx.stop_propagation();
+        exec("zsh", ["-c", "LANG=en_US.UTF-8 pbpaste"]).then((r) => {
+          if (r.code !== 0 || !r.stdout) return;
+          vimInsert(this.nv, r.stdout); this.notesChanged(cx);
+        }).catch(() => {});
+      }
+      return;
+    }
+    // ctrl and alt chords belong to Herdr (ctrl-tab, ctrl-1…9, …), except vim's ctrl-r redo.
+    if ((m.control && !(e.key === "r" && this.nv.mode === "normal")) || m.alt) return;
+    cx.stop_propagation();
+    if (vimKey(this.nv, e.key, e.key_char, m)) this.notesChanged(cx);
+    cx.notify();
+  }
+  notesChanged(cx) {
+    this.notesText = vimText(this.nv);
+    const id = (this.notesSave = (this.notesSave ?? 0) + 1);
+    cx.timer.after(500, () => { if (this.notesSave === id) this.saveNotes(); });
+    cx.notify();
+  }
+  saveNotes() {
+    const path = this.notesFor;
+    if (!path) return;
+    exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1"', "sh", path, vimText(this.nv)]).catch(() => {});
+  }
+
   // The Files panel on the right of the window, open or closed.
   filesOpen() {
     const findIn = (n, id) => (n?.id === id ? n : (n?.children ?? []).reduce((f, c) => f ?? findIn(c, id), null));
@@ -591,6 +867,35 @@ export default class ClaudeReader extends View {
   toggleFiles() {
     if (this.filesOpen()) run("layout.hide", { id: "panel" });
     else { run("layout.select", { stack: "panel-body", child: "files" }); run("layout.show", { id: "panel" }); }
+  }
+
+  // The notes as lines, with vim's cursor: a block in normal mode, a bar while inserting.
+  notesEditor(t, mono) {
+    const v = this.nv;
+    const on = this.nvHandle.is_focused?.() ?? false;
+    const ins = v.mode === "insert";
+    const rows = v.lines.map((l, i) => {
+      if (i !== v.row || !on) return div().id(`nv-${i}`).min_h(19).child(l.length ? l : " ");
+      const at = v.col;
+      const cur = ins
+        ? div().flex_none().w(2).h(16).bg(t.working)
+        : div().flex_none().bg(alpha(t.foreground, "cc")).text_color(t.popover).child(l[at] ?? " ");
+      return h_flex().id(`nv-${i}`).min_h(19).flex_wrap().items_center()
+        .when(at > 0, (x) => x.child(div().child(l.slice(0, at))))
+        .child(cur)
+        .child(div().child(l.slice(ins ? at : at + 1)));
+    });
+    return v_flex().gap(6)
+      .child(v_flex().id("sd-notes").w_full().min_h(220).p(10).rounded(8).border_1()
+        .border_color(on ? alpha(ins ? t.working : t.foreground, "66") : t.border).bg(alpha(t.foreground, "06"))
+        .font_family(mono).text_size(12.5).text_color(t.foreground).cursor_text()
+        .track_focus(this.nvHandle)
+        .on_key_down((e, cx) => this.notesKey(e, cx))
+        .on_mouse_down("left", (_e, cx) => { this.notesClickAt = Date.now(); this.nvHandle.focus(); cx.notify(); })
+        .when(!vimText(v).trim() && !ins, (x) => x.child(div().text_color(t.dim).child(on ? "Press i to write." : "Click to write. It is vim: i to insert, esc to stop.")))
+        .when(Boolean(vimText(v).trim()) || ins, (x) => x.children(rows)))
+      .child(h_flex().gap(10).text_size(10.5).text_color(t.dim)
+        .child(div().font_semibold().text_color(ins ? t.working : on ? t.muted : t.dim).child(ins ? "INSERT" : on ? "NORMAL" : "not focused")));
   }
 
   side(t, status, alone = false) {
@@ -712,6 +1017,15 @@ export default class ClaudeReader extends View {
           .child(label("PLAN"))
           .child(v_flex().gap(1).children(steps.map(stepRow)))));
     col = col
+        // Prompts queued for after this turn (prompt-queue), the next one first.
+        .when(Boolean(this.queued?.queue?.length), (e) => e.child(v_flex().gap(4)
+          .child(h_flex().items_center().gap(6).child(label(`QUEUED · ${this.queued.queue.length}`))
+            .when(Boolean(this.queued.paused), (x) => x.child(div().text_size(10.5).text_color(t.blocked).child("held until you answer"))))
+          .children(this.queued.queue.map((q, k) => h_flex().id(`sd-q-${k}`).gap(10).items_start().px(10).py(5).rounded(8)
+            .when(k === 0, (x) => x.bg(alpha(t.foreground, "08")))
+            .child(div().flex_none().w(36).text_size(10.5).font_semibold().text_color(k === 0 ? t.working : t.dim).child(k === 0 ? "NEXT" : `${k + 1}`))
+            .child(div().flex_1().min_w(0).text_size(12).text_color(k === 0 ? t.foreground : t.muted).child(q.length > 240 ? q.slice(0, 238) + "…" : q))))));
+    col = col
         // No plan: the turn's tools, the last few
         .when(!steps.length && plainTools.length > 0 && !wrap, (e) => e.child(v_flex().gap(2)
           .child(label(`ALATI · ${plainTools.length}`))
@@ -789,8 +1103,15 @@ export default class ClaudeReader extends View {
                   .when(d.lines.length > 120, (y) => y.child(div().px(10).pt(4).text_color(t.dim).child(`… ${d.lines.length - 120} more lines`))))));
           }))));
     // The keys that open what the buttons below open, for when the mouse is far away.
+    // Instead of the progress: your quick notes for this session.
+    if (this.notesOpen) {
+      col = v_flex().p(16).gap(10)
+        .child(h_flex().items_center().child(label("NOTES")).child(div().flex_1())
+          .child(div().text_size(10.5).text_color(t.dim).child("Saved as you type, kept with this session")))
+        .child(this.notesEditor(t, mono));
+    }
     // Instead of the progress: what the conversation mentioned, to copy (and links to open).
-    if (this.refsOpen) {
+    if (this.refsOpen && !this.notesOpen) {
       const refs = this.refs ?? [];
       const groups = [["link", "LINKS"], ["path", "PATHS"], ["command", "COMMANDS"], ["commit", "COMMITS"]];
       col = v_flex().p(16).gap(18)
@@ -841,12 +1162,22 @@ export default class ClaudeReader extends View {
       .child(svg("mods/workspace-chrome/file-text.svg").size(12).flex_none().text_color(t.muted))
       .child(div().text_color(t.muted).child("Read"));
     // What the conversation mentioned: links, paths, commands, commits (in place of the progress).
+    // Your quick notes (in place of the progress).
+    const nCount = (this.notesText ?? "").split("\n").filter((l) => l.trim()).length;
+    const notesButton = h_flex().id("sd-notes-btn").flex_none().gap(6).items_center().px(8).h(28).rounded(7).border_1().cursor_pointer().text_size(11.5)
+      .border_color(this.notesOpen ? alpha(t.working, "80") : t.border)
+      .when(Boolean(this.notesOpen), (x) => x.bg(alpha(t.working, "14")))
+      .hover((x) => x.bg(t.hover))
+      .tooltip(this.notesOpen ? "Back to progress" : "Quick notes for this session")
+      .on_click((_e, cx) => { this.notesOpen = !this.notesOpen; if (this.notesOpen) { this.refsOpen = false; this.focusNotes(cx); } cx.notify(); })
+      .child(div().text_color(this.notesOpen ? t.foreground : t.muted).child("Notes"))
+      .when(nCount > 0, (x) => x.child(div().text_size(11).text_color(t.dim).child(String(nCount))));
     const refsButton = h_flex().id("sd-refs").flex_none().gap(6).items_center().px(8).h(28).rounded(7).border_1().cursor_pointer().text_size(11.5)
       .border_color(this.refsOpen ? alpha(t.working, "80") : t.border)
       .when(Boolean(this.refsOpen), (x) => x.bg(alpha(t.working, "14")))
       .hover((x) => x.bg(t.hover))
       .tooltip(this.refsOpen ? "Back to progress" : "Links, paths and commands from the conversation")
-      .on_click((_e, cx) => { this.refsOpen = !this.refsOpen; cx.notify(); })
+      .on_click((_e, cx) => { this.refsOpen = !this.refsOpen; if (this.refsOpen) this.notesOpen = false; cx.notify(); })
       .child(div().text_color(this.refsOpen ? t.foreground : t.muted).child("Refs"))
       .when(Boolean(this.refs?.length), (x) => x.child(div().text_size(11).text_color(t.dim).child(String(this.refs.length))));
     // A side question about this session, answered apart from it (⌘⇧A).
@@ -865,7 +1196,7 @@ export default class ClaudeReader extends View {
       .on_click(() => this.toggleFiles())
       .child(svg("mods/files/file.svg").size(12).flex_none().text_color(filesOn ? t.foreground : t.muted))
       .child(div().text_color(filesOn ? t.foreground : t.muted).child("Files"));
-    const buttons = h_flex().flex_none().gap(6).child(refsButton).child(askButton).child(readButton).child(filesButton).child(allButton);
+    const buttons = h_flex().flex_none().gap(6).child(notesButton).child(refsButton).child(askButton).child(readButton).child(filesButton).child(allButton);
     // Kept at the bottom, under the scrolling part: the previous request, then all changes.
     foot = foot
         // The request before this one, folded to a line
@@ -902,7 +1233,7 @@ export default class ClaudeReader extends View {
         });
     if (!prev) foot = foot.child(h_flex().gap(8).items_center().child(div().flex_1()).child(buttons));
     // Under the buttons, the keys that open the same things, in the same order.
-    const KEYS = [["Previous", "⌘⇧H"], ["Refs", "⌘⇧E"], ["Ask", "⌘⇧A"], ["Read", "⌘R"], ["Files", "⌘⇧F"], ["Changes", "⌘⇧G"], ["Hide", "⌘⇧S"]];
+    const KEYS = [["Previous", "⌘⇧H"], ["Notes", "⌘⇧N"], ["Refs", "⌘⇧E"], ["Ask", "⌘⇧A"], ["Read", "⌘R"], ["Files", "⌘⇧F"], ["Changes", "⌘⇧G"], ["Hide", "⌘⇧S"]];
     foot = foot.child(h_flex().flex_wrap().justify_end().items_center().gap_x(14).gap_y(4).text_size(10.5)
       .children(KEYS.map(([w, k]) => h_flex().gap(5).items_center()
         .child(div().text_color(t.dim).child(w))
@@ -1053,13 +1384,14 @@ export default class ClaudeReader extends View {
     if (part === "side") {
       return v_flex().id("rd-root").size_full().min_h(0).text_color(t.foreground)
         .when((t.background ?? "").length !== 9, (e) => e.bg(t.background))
+        .track_focus(this.handle)
         .child(this.side(t, status, true));
     }
     return v_flex().id("rd-root").size_full().min_h(0).text_color(t.foreground)
       .when((t.background ?? "").length !== 9, (e) => e.bg(t.background))
       .track_focus(this.handle)
       .on_key_down((e, cx) => this.onKey(e, cx))
-      .on_mouse_down("left", (_e, cx) => { this.handle.focus(); cx.notify(); })
+      .on_mouse_down("left", (_e, cx) => { if (Date.now() - (this.notesClickAt ?? 0) > 100) this.handle.focus(); cx.notify(); })
       .when(part === "reading", (e) => e.bg(t.popover).child(this.bar(t, p)))
       .child(h_flex().flex_1().min_h(0).w_full()
       .when(part === "reading", (e) => e.child(this.toc(t)))
@@ -1076,7 +1408,7 @@ export default class ClaudeReader extends View {
           .on_click((_e, cx) => { this.follow = true; cx.notify(); })
           .child("↓ To the end"))))
       .when(part !== "chat" && part !== "reading", (e) => e.child(this.side(t, status))))
-      .when(keysHere, (e) => e.child(h_flex().flex_none().px(14).h(24).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
+      .when(true, (e) => e.child(h_flex().flex_none().when(!keysHere, (x) => x.opacity(0.45)).px(14).h(24).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().text_color(t.muted).child(title))
         .children([["j/k", "scroll"], ["d/u", "half page"], ["gg/G", "top/end"]].map(([k, w]) =>
           h_flex().gap(5).child(div().px(4).rounded(3).bg(t.raised).text_color(t.muted).child(k)).child(div().child(w))))));

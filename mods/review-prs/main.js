@@ -91,9 +91,14 @@ export default class ReviewPrs extends View {
   }
 
   refresh(cx) {
-    if (this.loading) return;
+    // A search that never answers (gh hung, a reload mid-call) must not leave the spinner on
+    // for good: after 40 s the next refresh starts over, and each run gives up after 30 s.
+    if (this.loading && Date.now() - (this.loadingAt ?? 0) < 40000) return;
     this.loading = true;
+    this.loadingAt = Date.now();
+    const run = (this.runId = (this.runId ?? 0) + 1);
     cx.notify();
+    cx.timer.after(30000, (cx) => { if (this.runId === run && this.loading) { this.loading = false; this.error = "GitHub did not answer in 30 s"; cx.notify(); } });
     cx.spawn(async (cx) => {
       try {
         // Some repos: only PRs that still need a review, as on the Review Dashboard.
@@ -114,8 +119,9 @@ export default class ReviewPrs extends View {
         // The picker's Review scope lists these.
         setShared("review.prs", this.prs.map(({ number, title, repository, author, url, updatedAt }) => ({ number, title, repository, author, url, updatedAt })));
       } catch (e) {
-        this.error = String(e?.message ?? e);
+        if (this.runId === run) this.error = String(e?.message ?? e);
       }
+      if (this.runId !== run) return;
       this.loading = false;
       cx.notify();
     });
