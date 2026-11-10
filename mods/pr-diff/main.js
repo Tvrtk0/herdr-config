@@ -2,7 +2,7 @@
 // props: { repo: "owner/name", number, url? }. Files on the left, the picked file's diff on the right.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list, TextView, VirtualListScrollHandle, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, TextView, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea } from "gpui-base";
 import { exec, hc, home, props, theme, settings, shared, setShared, focused, panes, spaces, agents, run, nextCommand, openOverlay, closeOverlay, readTextFile, appHome } from "herdr";
 
 // A see-through look (glass) has a translucent background: panes let it show through,
@@ -711,6 +711,12 @@ export default class PrDiff extends View {
     this.askInput = field("Ask Claude, or tell it what to look at…", () => this.ask());
     this.editInput = field("What should change in this comment?", () => this.sendEdit());
     this.bodyInput = field("Tekst reviewa (obavezan za Request changes)", () => this.askPost());
+    // A comment on lines of the diff (Files): picked by clicking line rows, shift-click for a range.
+    this.lineInput = TextareaState.new({ placeholder: "Leave a comment on these lines…", rows: 3 });
+    this.lineInput.set_auto_grow(3, 10);
+    this.lineInput.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
+    this.lineInput.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
+    this.lineInput.on("change", (_e, cx) => cx.notify());
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -966,6 +972,9 @@ export default class PrDiff extends View {
   // r review agent, R reload. Other chords pass through to the app.
   onKey(e, cx) {
     const m = e.modifiers ?? {};
+    if (this.sel && this.typing && m.platform && e.key === "enter") { cx.stop_propagation(); this.postLine(cx); return; }
+    if (this.sel && e.key === "escape" && !this.zoomed) { cx.stop_propagation(); this.clearSel(); this.handle.focus(); cx.notify(); return; }
+    if (this.zoomed && e.key === "escape") { cx.stop_propagation(); this.zoomed = null; cx.notify(); return; }
     // In a field: its keys are its own; esc gives them back to the pane.
     if (this.typing) {
       if (e.key === "escape") { cx.stop_propagation(); this.editing = null; this.handle.focus(); cx.notify(); }
@@ -1181,7 +1190,7 @@ export default class PrDiff extends View {
     cx.spawn(async (cx) => {
       try {
         const [view, threads] = await Promise.all([
-          exec("gh", ["pr", "view", String(this.number), "--repo", this.repo, "--json", "title,author,headRefName,baseRefName,isDraft,state,body,reviews,comments,statusCheckRollup,latestReviews,reviewRequests,createdAt,updatedAt"]),
+          exec("gh", ["pr", "view", String(this.number), "--repo", this.repo, "--json", "title,author,headRefName,headRefOid,baseRefName,isDraft,state,body,reviews,comments,statusCheckRollup,latestReviews,reviewRequests,createdAt,updatedAt"]),
           exec("gh", ["api", "graphql", "-F", `n=${this.number}`, "-f", `o=${owner}`, "-f", `r=${name}`, "-f", `query=${THREADS_QUERY}`]),
         ]);
         if (view.code === 0) { this.info = JSON.parse(view.stdout); this.conversation = conversationOf(this.info); this.checks = checksOf(this.info); }
@@ -1219,7 +1228,7 @@ export default class PrDiff extends View {
         const syntax = settings().dark === false ? "OneHalfLight" : "OneHalfDark";
         const [owner, name] = this.repo.split("/");
         const [view, diff, threads] = await Promise.all([
-          exec("gh", ["pr", "view", String(this.number), "--repo", this.repo, "--json", "title,author,headRefName,baseRefName,isDraft,state,body,reviews,comments,statusCheckRollup,latestReviews,reviewRequests,createdAt,updatedAt"]),
+          exec("gh", ["pr", "view", String(this.number), "--repo", this.repo, "--json", "title,author,headRefName,headRefOid,baseRefName,isDraft,state,body,reviews,comments,statusCheckRollup,latestReviews,reviewRequests,createdAt,updatedAt"]),
           exec("zsh", ["-c", DIFF_SCRIPT, "pr-diff", String(this.number), this.repo, syntax]),
           exec("gh", ["api", "graphql", "-F", `n=${this.number}`, "-f", `o=${owner}`, "-f", `r=${name}`, "-f", `query=${THREADS_QUERY}`]),
         ]);
@@ -1276,13 +1285,55 @@ export default class PrDiff extends View {
   }
 
   // Text with its images, tables and videos. live: handlers allowed (not inside the diff list).
+  // A file of this PR named by a mention: its whole path, or a unique tail of it.
+  fileFor(name) {
+    const n = String(name).replace(/^\.?\//, "");
+    const exact = this.files.find((f) => f.path === n);
+    if (exact) return exact.path;
+    const tail = this.files.filter((f) => f.path.endsWith(`/${n}`));
+    return tail.length ? tail[0].path : null;
+  }
+
+  // `file.tsx:42` (or a path, or a range 42-48) in code spans becomes a link into the diff;
+  // fenced code is left alone.
+  linkFiles(text) {
+    if (!this.files?.length || !text) return text;
+    return String(text).split(/(\x60\x60\x60[\s\S]*?\x60\x60\x60)/).map((part) => part.startsWith("\x60\x60\x60") ? part
+      : part.replace(/(?<!\[)\x60([\w@./-]+\.[A-Za-z0-9]{1,6})(?::(\d+)(?:[-–](\d+))?)?\x60/g, (all, name, line) => {
+        const path = this.fileFor(name);
+        return path ? `[${all}](https://herdr-diff.invalid/${encodeURIComponent(path)}?l=${line ?? ""})` : all;
+      })).join("");
+  }
+
+  // A link handler gets no context to redraw with: a shared value changing redraws every mod.
+  redraw() { setShared("pr-diff.redraw", Date.now()); }
+
+  // A link in any text here: into the diff when it names this PR's file or one of its review
+  // comments, else to the browser.
+  followLink(url) {
+    // An https form, which every markdown view treats as a link; .invalid never resolves.
+    const diff = /^https:\/\/herdr-diff\.invalid\/([^?]*)\?l=(\d*)$/.exec(url);
+    if (diff) { this.goToDraft({ path: decodeURIComponent(diff[1]), line: diff[2] ? Number(diff[2]) : null }); this.redraw(); return; }
+    const blob = /github\.com\/[^/]+\/[^/]+\/blob\/[^/]+\/([^#?]+)(?:#L(\d+))?/.exec(url);
+    if (blob && this.fileFor(decodeURIComponent(blob[1]))) {
+      this.goToDraft({ path: this.fileFor(decodeURIComponent(blob[1])), line: blob[2] ? Number(blob[2]) : null }); this.redraw(); return;
+    }
+    const disc = /#discussion_r(\d+)/.exec(url);
+    const th = disc && (this.threads ?? []).find((x) => x.comments.some((c) => String(c.url ?? "").includes(`discussion_r${disc[1]}`)));
+    if (th && th.path) {
+      (this.expanded ??= new Set()).add(th.id);
+      this.goToDraft({ path: th.path, line: th.line ?? th.originalLine ?? null }); this.redraw(); return;
+    }
+    exec("open", [url]).catch(() => {});
+  }
+
   richBody(text, key, t, maxW = 860, live = true) {
-    return v_flex().w_full().children(bodyParts(text).map((p, i) =>
+    return v_flex().w_full().children(bodyParts(live ? this.linkFiles(text) : text).map((p, i) =>
       p.table ? this.tablePart(p.table, `${key}-${i}`, t, maxW, live)
       : p.video ? this.videoPart(p.video, `${key}-${i}`, t, live, maxW)
       : p.image !== undefined ? this.imagePart(p, `${key}-${i}`, t, maxW, 560, live)
       : live
-        ? TextView.markdown(`md-${key}-${i}`, p.text).selectable(true).on_link_click((url) => exec("open", [url]).catch(() => {}))
+        ? TextView.markdown(`md-${key}-${i}`, p.text).selectable(true).on_link_click((url) => this.followLink(url))
         : TextView.markdown(`md-${key}-${i}`, p.text).selectable(true)));
   }
 
@@ -1291,6 +1342,8 @@ export default class PrDiff extends View {
     const img = this.images?.get?.(imageKey(p.url));
     const caption = p.alt ? div().text_size(11.5).text_color(t.dim).child(p.alt) : null;
     const opens = (el) => live ? el.cursor_pointer().on_click(() => exec("open", [p.url]).catch(() => {})) : el;
+    // A downloaded picture opens large in place; esc (or a click) closes it.
+    const zooms = (el) => el.cursor_pointer().tooltip("Click to enlarge").on_click((_e, cx) => { cx.stop_propagation(); this.zoomed = { ...img, url: p.url, alt: p.alt }; this.handle.focus(); cx.notify(); });
     if (!img) {
       return opens(h_flex().id(`pr-img-${key}`).my(6).gap(6).items_center().text_size(12).text_color(t.dim))
         .child(this.imagesLoading ? svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.dim).spin(900) : div().child("↗"))
@@ -1298,8 +1351,26 @@ export default class PrDiff extends View {
     }
     const scale = Math.min(1, maxW / img.w, maxH / img.h);
     return v_flex().id(`pr-img-${key}`).my(8).gap(4).items_start()
-      .child(opens(image(img.path).w(Math.round(img.w * scale)).h(Math.round(img.h * scale)).rounded(6).border_1().border_color(t.border)))
+      // The click sits on a wrapping div: image() takes no pointer handlers of its own.
+      .child(zooms(div().id(`pr-img-z-${key}`).child(image(img.path).w(Math.round(img.w * scale)).h(Math.round(img.h * scale)).rounded(6).border_1().border_color(t.border))))
       .when(Boolean(caption), (e) => e.child(caption));
+  }
+
+  // The enlarged picture over the whole pane: as large as fits, never past its own size.
+  zoomView(t) {
+    const z = this.zoomed;
+    const W = Math.max(200, (this.rootW ?? 1200) - 48), H = Math.max(200, (this.rootH ?? 800) - 72);
+    const scale = Math.min(1, W / z.w, H / z.h);
+    return v_flex().id("pr-zoom").absolute().top(0).left(0).size_full().bg(alpha(t.background.length === 9 ? t.background.slice(0, 7) : t.background, "f2"))
+      .items_center().justify_center().gap(10).cursor_pointer()
+      .on_click((_e, cx) => { this.zoomed = null; cx.notify(); })
+      .child(image(z.path).w(Math.round(z.w * scale)).h(Math.round(z.h * scale)).rounded(8))
+      .child(h_flex().gap(14).text_size(11.5).text_color(t.dim)
+        .when(Boolean(z.alt), (e) => e.child(div().text_color(t.muted).child(z.alt)))
+        .child(div().child("esc or click to close"))
+        .child(div().id("pr-zoom-open").text_color(t.muted).hover((s) => s.text_color(t.foreground))
+          .on_click((_e, cx) => { cx.stop_propagation(); exec("open", [z.url]).catch(() => {}); })
+          .child("Open in browser ↗")));
   }
 
   // Inline parts inside a table cell: images sized to the column, text as markdown.
@@ -1309,7 +1380,7 @@ export default class PrDiff extends View {
       : head
         ? div().font_semibold().text_size(12.5).child(p.text.replace(/[*_`]/g, "").trim())
         : live
-          ? TextView.markdown(`pr-md-${key}-${i}`, p.text).selectable(true).on_link_click((url) => exec("open", [url]).catch(() => {}))
+          ? TextView.markdown(`pr-md-${key}-${i}`, p.text).selectable(true).on_link_click((url) => this.followLink(url))
           : TextView.markdown(`pr-md-${key}-${i}`, p.text).selectable(true));
   }
 
@@ -1343,6 +1414,7 @@ export default class PrDiff extends View {
   }
 
   pick(path) {
+    if (path !== this.open) this.sel = null;
     this.open = path;
     // A half page still easing on the last file would scroll this one.
     this.anim = (this.anim ?? 0) + 1;
@@ -1358,6 +1430,99 @@ export default class PrDiff extends View {
     // Keep the picked file's row in view in the tree.
     const ti = this.treeItems().findIndex((it) => it.key === `f:${path}`);
     if (ti >= 0) this.treeScroller.scroll_to_item(ti);
+  }
+
+  // The line a diff row stands for, as GitHub addresses it: deleted lines on the LEFT (old
+  // numbers), the rest on the RIGHT (new numbers). Null for a hunk header.
+  lineOf(r) {
+    if (!r || r.kind === "@") return null;
+    if (r.kind === "pair") return r.r ? { side: "RIGHT", line: r.r.b } : r.l ? { side: "LEFT", line: r.l.a } : null;
+    return r.kind === "-" ? { side: "LEFT", line: r.a } : { side: "RIGHT", line: r.b };
+  }
+
+  // A click on a line row: picks it, or with shift held extends the pick on the same side.
+  pickLine(index, cx) {
+    const src = this.splitHere ? this.pairs : this.rows;
+    const r = src?.[index];
+    const at = this.lineOf(r);
+    if (!at || at.line == null) return;
+    const s = this.sel;
+    if (this.shift && s && s.path === this.open && s.side === at.side && s.split === this.splitHere) {
+      s.lo = Math.min(s.anchor, index); s.hi = Math.max(s.anchor, index);
+    } else {
+      this.sel = { path: this.open, side: at.side, split: this.splitHere, anchor: index, lo: index, hi: index };
+    }
+    this.markSel();
+    cx.timer.after(30, () => this.lineInput.focus());
+    cx.notify();
+  }
+
+  // The picked rows, and the first and last line numbers among them.
+  markSel() {
+    const s = this.sel;
+    const src = s ? (s.split ? this.pairs : this.rows) : null;
+    this.selRows = new Set();
+    if (!s || !src) return;
+    const lines = [];
+    for (let i = s.lo; i <= s.hi; i++) {
+      const at = this.lineOf(src[i]);
+      if (!at || at.side !== s.side || at.line == null) continue;
+      this.selRows.add(src[i]);
+      lines.push(at.line);
+    }
+    s.start = Math.min(...lines); s.end = Math.max(...lines);
+  }
+
+  clearSel() {
+    this.sel = null; this.selRows = new Set(); this.lineError = null;
+    this.lineInput.set_value("");
+  }
+
+  // Posts the comment as a single review comment on GitHub (as "Add single comment" does).
+  postLine(cx) {
+    const s = this.sel, body = this.lineInput.value().trim();
+    const sha = this.info?.headRefOid;
+    if (!s || !body || this.linePosting) return;
+    if (!sha) { this.lineError = "The PR's head commit is not loaded yet; press R and try again."; cx.notify(); return; }
+    const args = ["api", "--method", "POST", `repos/${this.repo}/pulls/${this.number}/comments`,
+      "-f", `body=${body}`, "-f", `commit_id=${sha}`, "-f", `path=${s.path}`, "-F", `line=${s.end}`, "-f", `side=${s.side}`];
+    if (s.start < s.end) args.push("-F", `start_line=${s.start}`, "-f", `start_side=${s.side}`);
+    this.linePosting = true; this.lineError = null; cx.notify();
+    cx.spawn(async (cx) => {
+      const r = await exec("gh", args).catch((e) => ({ code: 1, stderr: String(e) }));
+      this.linePosting = false;
+      if (r.code === 0) { this.clearSel(); this.handle.focus(); this.refreshMeta(cx); }
+      else {
+        let msg = (r.stderr || r.stdout || "").trim();
+        try { msg = JSON.parse(r.stdout).message ?? msg; } catch {}
+        this.lineError = /must be part of the diff|line could not be resolved|422/i.test(msg) ? "GitHub refused these lines: a range must stay inside one hunk of the diff." : msg.split("\n").pop();
+      }
+      cx.notify();
+    });
+  }
+
+  // The box under the diff while lines are picked.
+  lineComposer(t) {
+    const s = this.sel;
+    const where = s.start === s.end ? `line ${s.end}` : `lines ${s.start}–${s.end}`;
+    const can = this.lineInput.value().trim().length > 0 && !this.linePosting;
+    return v_flex().id("line-composer").flex_none().gap(8).px(12).py(10).border_t(1).border_color(t.border).bg(t.raised)
+      .child(h_flex().gap(8).items_center().text_size(11.5)
+        .child(div().font_semibold().text_color(t.foreground).child(`Comment on ${where}`))
+        .child(div().text_color(t.dim).child(`${s.side === "LEFT" ? "old" : "new"} side · shift-click to extend`))
+        .child(div().flex_1())
+        .child(div().id("line-cancel").px(8).h(24).flex().items_center().rounded(6).cursor_pointer().text_color(t.muted)
+          .hover((x) => x.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => { this.clearSel(); this.handle.focus(); cx.notify(); }).child("Cancel"))
+        .child(div().id("line-post").px(10).h(24).flex().items_center().gap(6).rounded(6).text_size(12)
+          .when(can, (x) => x.bg(t.solid).text_color(t.solid_foreground).cursor_pointer().hover((y) => y.opacity(0.9)).on_click((_e, cx) => this.postLine(cx)))
+          .when(!can, (x) => x.border_1().border_color(t.border).text_color(t.dim))
+          .child(div().child(this.linePosting ? "Posting…" : "Comment"))
+          .child(div().text_size(10.5).opacity(0.75).child("⌘↵"))))
+      .child(div().id("line-field").w_full().rounded(8).border_1().border_color(t.input).bg(t.background).p(4)
+        .on_mouse_down("left", () => { this.typing = true; this.lineInput.focus(); })
+        .child(Textarea.new(this.lineInput).w_full().text_size(12.5)))
+      .when(Boolean(this.lineError), (x) => x.child(div().text_size(11.5).text_color(t.ansi1).child(this.lineError)));
   }
 
   // How many characters of code fit on one line of the shown view.
@@ -1564,6 +1729,7 @@ export default class PrDiff extends View {
   splitRow(p, t, n, h) {
     if (p.kind === "@") return div().w_full().px(12).h(ROW_H).flex_none().truncate().bg(t.raised).text_color(t.dim).child(p.text);
     return h_flex().w_full().h(h).flex_none().items_start()
+      .when(Boolean(this.selRows?.has(p)), (e) => e.bg(alpha(t.accent ?? t.ansi4, "2e")).border_l(2).border_color(t.accent ?? t.ansi4))
       .child(this.half(p.l, "a", t, n, h))
       .child(div().w(1).h_full().flex_none().bg(t.border))
       .child(this.half(p.r, "b", t, n, h));
@@ -1574,6 +1740,7 @@ export default class PrDiff extends View {
     return h_flex().w_full().h(h).flex_none().gap(8).items_start().overflow_hidden()
       .when(r.kind === "+", (e) => e.bg(alpha(t.ansi2, "1c")))
       .when(r.kind === "-", (e) => e.bg(alpha(t.ansi1, "1c")))
+      .when(Boolean(this.selRows?.has(r)), (e) => e.bg(alpha(t.accent ?? t.ansi4, "2e")).border_l(2).border_color(t.accent ?? t.ansi4))
       .child(this.cell(40, t.dim, r.a === undefined ? "" : String(r.a), true))
       .child(this.cell(40, t.dim, r.b === undefined ? "" : String(r.b), true))
       .child(this.cell(10, r.kind === "+" ? t.ansi2 : r.kind === "-" ? t.ansi1 : t.dim, r.kind === " " ? "" : r.kind))
@@ -1922,6 +2089,27 @@ export default class PrDiff extends View {
       const inDiff = dr.path && this.files.some((f) => f.path === dr.path);
       const lc = lenColor(dr.count);
       const editing = this.editing === dr.n;
+      // Already on GitHub: one quiet line (a check, where, the comment's start); a click opens
+      // the full card again.
+      if (done && !this.postedOpen?.has(dr.n)) {
+        const first = String(dr.body ?? "").replace(/[`*_>#]/g, "").replace(/\s+/g, " ").trim();
+        return div().id(`dr-w-${dr.n}`).w_full().pb(6)
+          .on_size_change((size) => { this.drHeights[dr.n] = size.height; })
+          .child(h_flex().id(`dr-${dr.n}`).px(12).h(38).gap(10).items_center().rounded(8).cursor_pointer()
+            .border_1().border_color(here ? t.accent : alpha(t.ansi2, "33")).bg(alpha(t.ansi2, "0a"))
+            .hover((x) => x.bg(alpha(t.ansi2, "14")))
+            .on_click((_e, cx) => { (this.postedOpen ??= new Set()).add(dr.n); this.cardSel = i; cx.notify(); })
+            .child(div().size(18).flex_none().rounded(9).bg(alpha(t.ansi2, "26")).flex().items_center().justify_center()
+              .child(svg("mods/workspace-chrome/check.svg").size(11).text_color(t.ansi2)))
+            .child(div().flex_none().text_size(12.5).font_semibold().text_color(t.muted).child(String(dr.n)))
+            .child(div().flex_none().text_size(11.5).font_family(settings().font_family ?? "JetBrains Mono").text_color(t.dim)
+              .child(dr.path ? `${dr.path.split("/").pop()}${dr.line ? `:${dr.line}` : ""}` : "PR komentar"))
+            .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(first))
+            .child(div().id(`dr-done-${dr.n}`).flex_none().px(6).h(20).flex().items_center().rounded(5).text_size(11)
+              .text_color(t.ansi2).hover((x) => x.bg(alpha(t.ansi2, "1f"))).tooltip("Open on GitHub")
+              .on_click((_e, cx) => { cx.stop_propagation(); if (typeof done === "string") exec("open", [done]).catch(() => {}); })
+              .child("Posted ↗")));
+      }
       return div().id(`dr-w-${dr.n}`).w_full().pb(12)
         .on_size_change((size) => { this.drHeights[dr.n] = size.height; })
         .child(v_flex().id(`dr-${dr.n}`).rounded(10).border_1().overflow_hidden()
@@ -1943,7 +2131,8 @@ export default class PrDiff extends View {
             .when(Boolean(done), (e) => e.child(div().id(`dr-done-${dr.n}`).flex_none().px(6).h(20).flex().items_center().rounded(5).text_size(11)
               .bg(alpha(t.ansi2, "1f")).text_color(t.ansi2).cursor_pointer().tooltip("Open on GitHub")
               .on_click((_e, cx) => { cx.stop_propagation(); if (typeof done === "string") exec("open", [done]).catch(() => {}); })
-              .child("Objavljeno ↗")))
+              .child("Posted ↗")))
+            .when(Boolean(done), (e) => e.child(smallButton(`dr-fold-${dr.n}`, "Fold", () => { this.postedOpen?.delete(dr.n); })))
             .when(Boolean(a) && !done && !editing, (e) => e.child(smallButton(`dr-edit-${dr.n}`, "Promijeni", () => { this.cardSel = i; this.startEdit(dr.n); }))))
           // The comment as GitHub will show it; the full path under it.
           .child(v_flex().px(16).py(12).gap(6)
@@ -2002,9 +2191,31 @@ export default class PrDiff extends View {
           : a?.status === "working" ? "Comments show up here as soon as Claude drafts them."
           : "Claude drafted no comments."))
         .when(!a, (e) => e.child(smallButton("dr-start", "Review with Claude", () => this.startReview(), true)))
-      : v_flex().w_full().children(list.map(card));
+      : (() => {
+        const waiting = list.map((d, i) => [d, i]).filter(([d]) => !this.posted(d));
+        const sent = list.map((d, i) => [d, i]).filter(([d]) => this.posted(d));
+        return v_flex().w_full()
+          .children(waiting.map(([d, i]) => card(d, i)))
+          .when(sent.length > 0, (e) => e.child(h_flex().gap(8).items_center().pt(waiting.length ? 10 : 0).pb(8)
+            .child(div().text_size(11).font_semibold().text_color(t.ansi2).child(`POSTED · ${sent.length}`))
+            .child(div().flex_1().h(1).bg(alpha(t.ansi2, "33")))))
+          .children(sent.map(([d, i]) => card(d, i)));
+      })();
+    const mine = this.myReview();
+    const allPosted = list.length > 0 && list.every((d) => this.posted(d));
+    const doneBar = (() => {
+      if (!mine || !allPosted) return null;
+      const [label, color] = { APPROVED: ["You approved", t.ansi2], CHANGES_REQUESTED: ["You requested changes", t.ansi1], COMMENTED: ["You commented", t.accent ?? t.ansi4] }[mine.state] ?? ["Review sent", t.ansi2];
+      return h_flex().flex_none().mb(12).px(14).h(48).gap(10).items_center().rounded(10).border_1().border_color(alpha(color, "59")).bg(alpha(color, "12"))
+        .child(div().size(22).flex_none().rounded(11).bg(alpha(color, "2e")).flex().items_center().justify_center()
+          .child(svg("mods/workspace-chrome/check.svg").size(13).text_color(color)))
+        .child(div().text_size(13).font_semibold().text_color(color).child(`Review submitted · ${label}`))
+        .child(div().text_size(12).text_color(t.muted).child(`all ${list.length} comment${list.length > 1 ? "s" : ""} on GitHub`))
+        .child(div().flex_1())
+        .child(smallButton("dr-gh", "Open on GitHub", () => exec("open", [this.url ?? `https://github.com/${this.repo}/pull/${this.number}`]).catch(() => {})));
+    })();
     const main = v_flex().flex_1().min_w(0).h_full().min_h(0)
-      .when(list.length > 0, (e) => e.child(bar))
+      .when(list.length > 0, (e) => e.child(doneBar ?? bar))
       .child(div().flex_1().min_h(0).child(this.pager("agent", t, div().pr(6).pb(16).child(cards))));
     return h_flex().size_full().min_h(0).px(24).pt(16).pb(12).justify_center()
       .child(h_flex().w_full().max_w(1400).h_full().min_h(0).gap(16).items_start()
@@ -2323,9 +2534,14 @@ export default class PrDiff extends View {
               : this.splitHere ? this.splitRow(item.r, t, n, h) : this.diffRow(item.r, t, n, h);
           });
         }).size_full().track_scroll(this.scroller)
-          .on_item_click((key, cx) => this.toggleThread(key.slice(key.lastIndexOf(":th:") + 1), cx))
+          .on_item_click((key, cx) => {
+            const m = /:r(\d+)$/.exec(key);
+            if (m && !this.changes) this.pickLine(Number(m[1]), cx);
+            else this.toggleThread(key.slice(key.lastIndexOf(":th:") + 1), cx);
+          })
           .on_item_secondary_click((key) => this.openThread(key.slice(key.lastIndexOf(":th:") + 1))))
-        .child(Scrollbar.vertical(scrollId).viewport_from_layout().absolute().inset_0()));
+        .child(Scrollbar.vertical(scrollId).viewport_from_layout().absolute().inset_0()))
+      .when(Boolean(this.sel) && !this.changes && this.sel?.path === this.open, (e) => e.child(this.lineComposer(t)));
 
     const content = this.tab === "desc" ? description
       : this.tab === "comments" ? this.commentsView(t)
@@ -2363,17 +2579,22 @@ export default class PrDiff extends View {
     const keys = h_flex().flex_none().px(14).h(24).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
       .children(keyList.map(([k, what]) => h_flex().gap(5).child(div().px(4).rounded(3).bg(t.raised).text_color(t.muted).child(k)).child(div().child(what))));
 
-    return v_flex().id("pr-diff-root").size_full().min_h(0).when(!glassy(t), (e) => e.bg(t.background))
+    return v_flex().id("pr-diff-root").relative().size_full().min_h(0).when(!glassy(t), (e) => e.bg(t.background))
+      .on_size_change((size, cx) => { if (Math.abs(size.width - (this.rootW ?? 0)) >= 1 || Math.abs(size.height - (this.rootH ?? 0)) >= 1) { this.rootW = size.width; this.rootH = size.height; cx.notify(); } })
       // As an overlay it covers a terminal: solid, so the diff is not read over it.
       .when(Boolean(props()?.overlay), (e) => e.bg(t.popover))
       .text_color(t.foreground).text_size(13)
       .track_focus(this.handle)
       .on_key_down((e, cx) => this.onKey(e, cx))
+      .on_modifiers_changed((e) => { this.shift = Boolean(e.modifiers?.shift); })
       .on_mouse_down("left", (_e, cx) => { if (!this.typing) this.handle.focus(); cx.notify(); })
       .child(this.changes ? this.changesHeader(t) : header)
       .when(!this.changes, (e) => e.child(tabBar))
       .when(Boolean(this.error) && this.files.length > 0, (e) => e.child(div().px(14).py(4).text_size(11.5).text_color(t.blocked).child(this.error)))
       .child(div().flex_1().min_h(0).child(content))
-      .when(focusedHere, (e) => e.child(keys));
+      // Always there, so selecting text (which takes the keyboard) does not make the page jump;
+      // dimmed while the keys are elsewhere.
+      .child(keys.when(!focusedHere, (x) => x.opacity(0.45)))
+      .when(Boolean(this.zoomed), (e) => e.child(this.zoomView(t)));
   }
 }

@@ -874,19 +874,38 @@ export default class ClaudeReader extends View {
     const v = this.nv;
     const on = this.nvHandle.is_focused?.() ?? false;
     const ins = v.mode === "insert";
-    const rows = v.lines.map((l, i) => {
-      if (i !== v.row || !on) return div().id(`nv-${i}`).min_h(19).child(l.length ? l : " ");
-      const at = v.col;
-      const cur = ins
-        ? div().flex_none().w(2).h(16).bg(t.working)
-        : div().flex_none().bg(alpha(t.foreground, "cc")).text_color(t.popover).child(l[at] ?? " ");
-      return h_flex().id(`nv-${i}`).min_h(19).flex_wrap().items_center()
-        .when(at > 0, (x) => x.child(div().child(l.slice(0, at))))
-        .child(cur)
-        .child(div().child(l.slice(ins ? at : at + 1)));
+    // Lines are cut into rows that fit the box (a mono character is about 7.6 px at 12.5):
+    // a plain div of code text does not wrap on its own, and the cursor row is split in parts.
+    const per = Math.max(10, Math.floor(((this.nvW ?? 320) - 22) / 7.6));
+    const rows = [];
+    v.lines.forEach((l, i) => {
+      const chunks = [];
+      // Cut at the last space that fits (the space stays at the end of the row), else mid-word.
+      let k = 0;
+      do {
+        let end = Math.min(l.length, k + per);
+        if (end < l.length) { const sp = l.lastIndexOf(" ", end); if (sp > k) end = sp + 1; }
+        chunks.push([k, l.slice(k, end)]);
+        k = end;
+      } while (k < l.length);
+      // In insert mode the cursor may sit just past a full row: it belongs at the end of that row.
+      chunks.forEach(([from, text], ci) => {
+        const last = ci === chunks.length - 1;
+        const mine = on && i === v.row && v.col >= from && (v.col < from + per || (last && v.col <= from + text.length));
+        if (!mine) { rows.push(div().id(`nv-${i}-${ci}`).h(19).flex_none().whitespace_nowrap().child(text.length ? text : " ")); return; }
+        const at = v.col - from;
+        const cur = ins
+          ? div().flex_none().w(2).h(16).bg(t.working)
+          : div().flex_none().bg(alpha(t.foreground, "cc")).text_color(t.popover).child(text[at] ?? " ");
+        rows.push(h_flex().id(`nv-${i}-${ci}`).h(19).flex_none().items_center().whitespace_nowrap()
+          .when(at > 0, (x) => x.child(div().child(text.slice(0, at))))
+          .child(cur)
+          .child(div().child(text.slice(ins ? at : at + 1))));
+      });
     });
     return v_flex().gap(6)
-      .child(v_flex().id("sd-notes").w_full().min_h(220).p(10).rounded(8).border_1()
+      .child(v_flex().id("sd-notes").w_full().min_w(0).min_h(220).p(10).overflow_hidden()
+        .on_size_change((size, cx) => { if (Math.abs(size.width - (this.nvW ?? 0)) >= 1) { this.nvW = size.width; cx.notify(); } }).rounded(8).border_1()
         .border_color(on ? alpha(ins ? t.working : t.foreground, "66") : t.border).bg(alpha(t.foreground, "06"))
         .font_family(mono).text_size(12.5).text_color(t.foreground).cursor_text()
         .track_focus(this.nvHandle)
@@ -1068,7 +1087,14 @@ export default class ClaudeReader extends View {
             .child(div().flex_1().min_w(0).text_color(t.foreground).child(String(line))))))
           .when(Boolean(wrap.forYou), (el) => el.child(v_flex().gap(3).p(10).rounded(8).bg(alpha(t.blocked, "1a")).border_1().border_color(alpha(t.blocked, "4d"))
             .child(div().text_size(11).font_semibold().text_color(t.blocked).child("FOR YOU"))
-            .child(div().text_size(12.5).text_color(t.foreground).child(wrap.forYou))))));
+            .child(div().text_size(12.5).text_color(t.foreground).child(wrap.forYou))))
+          // Likely next steps: a number in the prompt picks one; nothing starts on its own.
+          .when(Boolean(wrap.next?.length), (el) => el.child(v_flex().gap(4)
+            .child(h_flex().gap(8).items_center().child(div().text_size(11).font_semibold().text_color(t.dim).child("NEXT"))
+              .child(div().text_size(10.5).text_color(t.dim).child("type its number in the prompt")))
+            .children(wrap.next.map((x, k) => h_flex().gap(8).items_start().text_size(12.5)
+              .child(div().flex_none().w(16).h(16).rounded(4).bg(t.raised).flex().items_center().justify_center().text_size(10.5).text_color(t.muted).child(String(k + 1)))
+              .child(div().flex_1().min_w(0).text_color(t.foreground).child(x))))))));
     col = col
         // Files changed in this request
         .when(files.size > 0, (e) => e.child(v_flex().gap(4)
