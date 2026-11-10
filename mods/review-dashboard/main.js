@@ -158,6 +158,11 @@ export default class ReviewDashboard extends View {
         });
         this.data = data;
         this.at = Date.now();
+        // Stacks: every open PR of these repos, head and base branches, one cheap list per repo.
+        const repos = [...new Set(Object.values(data).flat().map((p) => p.repo))];
+        const lists = await Promise.all(repos.map((r) => exec("gh", ["pr", "list", "--repo", r, "--state", "open", "--limit", "200", "--json", "number,headRefName,baseRefName,title"])));
+        this.stacks = {};
+        repos.forEach((r, i) => { try { this.stacks[r] = JSON.parse(lists[i].stdout || "[]"); } catch { this.stacks[r] = []; } });
         this.error = null;
         localStorage.setItem("data", JSON.stringify(data));
         localStorage.setItem("at", String(this.at));
@@ -170,7 +175,7 @@ export default class ReviewDashboard extends View {
   }
 
   // The PR's tab in the review space: the open one, else a new one. Returns its id.
-  openPr(pr) {
+  openPr(pr, show = true) {
     const name = `#${pr.number}`;
     let space = spaces().find((s) => s.name.toLowerCase() === REVIEW_SPACE);
     if (!space) {
@@ -183,8 +188,10 @@ export default class ReviewDashboard extends View {
       run("tab.new", { space: space.id, name, mod: "pr-diff", props: { repo: pr.repo, number: pr.number, url: pr.url } });
       tab = spaces().find((s) => s.id === space.id)?.tabs.find((tb) => tb.name === name);
     }
-    run("space.select", { id: space.id });
-    if (tab) run("tab.select", { id: tab.id });
+    if (show) {
+      run("space.select", { id: space.id });
+      if (tab) run("tab.select", { id: tab.id });
+    }
     return tab?.id ?? null;
   }
 
@@ -210,30 +217,53 @@ export default class ReviewDashboard extends View {
       this.say(`#${pr.number} se već reviewa. Agent te vodi do njega.`, cx);
       return;
     }
+    // One start at a time per PR: a second press while the tab is still being made waits.
+    if (this.starting === key) return;
+    this.starting = key;
     const here = focused();
-    const tab = this.openPr(pr);
-    const pane = tab && panes().find((p) => p.tab === tab && p.mod === "pr-diff");
-    if (pane) {
+    // Made out of sight: the dashboard stays shown.
+    this.openPr(pr, false);
+    const stay = () => {
+      const f = focused();
+      if (here?.space && f?.space !== here.space) run("space.select", { id: here.space });
+      if (here?.tab && f?.tab !== here.tab) run("tab.select", { id: here.tab });
+    };
+    cx.timer.after(0, stay);
+    // Herdr makes the space and the tab a moment after it is asked: look for the PR's pane a
+    // few times instead of once, which is why the first press used to do nothing.
+    const attempt = (n, cx) => {
+      const space = spaces().find((s) => s.name.toLowerCase() === REVIEW_SPACE);
+      const tab = space?.tabs.find((tb) => tb.name === `#${pr.number}`);
+      const pane = tab && panes().find((p) => p.tab === tab.id && p.mod === "pr-diff");
+      if (!pane) {
+        // A new review space comes up empty the first time: ask for the PR's tab again.
+        if (!tab && n % 4 === 3) { this.openPr(pr, false); cx.timer.after(0, stay); }
+        if (n < 20) cx.timer.after(150, (cx) => attempt(n + 1, cx));
+        else { this.starting = null; this.say(`#${pr.number} se nije otvorio, probaj opet.`, cx); }
+        return;
+      }
       const { dir, skill } = REVIEWERS[pr.repo] ?? REVIEWERS.default;
       const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-      setShared(AGENTS_KEY, { ...(shared(AGENTS_KEY) ?? {}), [key]: { tab, at: Date.now() } });
+      setShared(AGENTS_KEY, { ...(shared(AGENTS_KEY) ?? {}), [key]: { tab: tab.id, at: Date.now() } });
       run("pane.split", { direction: "right", pane: pane.pane, argv: ["/bin/zsh", "-lc", `cd ${dir} && exec claude ${q(`${skill} ${pr.url}`)}`] });
-      // As the PR tab's own button does: the diff keeps the tab, the agent works behind it.
-      run("pane.zoom", { pane: pane.pane });
-      run("pane.focus", { pane: pane.pane });
-    }
-    // Back to the dashboard.
-    if (here?.space) run("space.select", { id: here.space });
-    if (here?.tab) run("tab.select", { id: here.tab });
-    if (here?.pane) run("pane.focus", { pane: here.pane });
-    this.say(`Claude reviewa #${pr.number}. Kad završi, PR dobije oznaku Review ready.`, cx);
-    // Keys stay here: Herdr hands the keyboard round as the tabs switch, so take it back
-    // once that settles, a few times over.
-    const id = (this.refocus = (this.refocus ?? 0) + 1);
-    for (const ms of [0, 60, 150, 300, 600, 1000]) cx.timer.after(ms, (cx) => {
-      if (this.refocus !== id || (here?.pane && focused()?.pane !== here.pane)) return;
-      if (!this.handle.is_focused()) { this.handle.focus(); cx.notify(); }
-    });
+      // As the PR tab's own button does: the diff keeps the tab, the agent works behind it. No
+      // focus moves: the dashboard stays shown (and if Herdr switched anyway, straight back).
+      cx.timer.after(0, stay);
+      cx.timer.after(120, () => { run("pane.zoom", { pane: pane.pane }); stay(); });
+      cx.timer.after(250, (cx) => {
+        stay();
+        if (here?.pane) run("pane.focus", { pane: here.pane });
+        this.starting = null;
+        this.say(`Claude reviewa #${pr.number}. Kad završi, PR dobije oznaku Review ready.`, cx);
+        // Keys stay here: Herdr hands the keyboard round as the tabs switch.
+        for (const ms of [0, 100, 300, 600]) cx.timer.after(ms, (cx) => {
+          if (here?.pane && focused()?.pane !== here.pane) return;
+          if (!this.handle.is_focused()) { this.handle.focus(); cx.notify(); }
+        });
+      });
+    };
+    cx.timer.after(150, (cx) => attempt(0, cx));
+    cx.notify();
   }
 
   // A line under the title for a few seconds, instead of a toast that would take the keys.
@@ -422,7 +452,6 @@ export default class ReviewDashboard extends View {
   sizeBlock(pr, t) {
     const n = pr.add + pr.del;
     const step = n < 50 ? 1 : n < 250 ? 2 : n < 800 ? 3 : n < 2000 ? 4 : 5;
-    const word = ["", "Tiny", "Small", "Medium", "Large", "Huge"][step];
     const color = step <= 2 ? t.ansi2 : step === 3 ? t.working : t.ansi1;
     return v_flex().w(132).flex_none().gap(5).items_end().text_size(11.5)
       .child(h_flex().gap(6).items_center()
@@ -430,7 +459,7 @@ export default class ReviewDashboard extends View {
         .child(div().text_color(t.ansi1).child(`−${pr.del}`)))
       .child(h_flex().gap(6).items_center().text_color(t.dim)
         .tooltip(`${n} lines in ${pr.files} file${pr.files === 1 ? "" : "s"}`)
-        .child(div().child(`${word} · ${pr.files} file${pr.files === 1 ? "" : "s"}`))
+        .child(div().child(`${pr.files} file${pr.files === 1 ? "" : "s"}`))
         .child(h_flex().gap(2).children([1, 2, 3, 4, 5].map((i) => div().w(4).h(8).rounded(1).bg(i <= step ? color : t.input)))));
   }
 
@@ -442,6 +471,27 @@ export default class ReviewDashboard extends View {
     if (pr.openThreads > 0) out.push(this.chip(`${pr.openThreads} open thread${pr.openThreads > 1 ? "s" : ""}`, t.blocked, t, `${pr.openThreads} open of ${pr.threads} threads`));
     else if (pr.threads > 0) out.push(this.chip(`${pr.threads} resolved`, t.dim, t, `${pr.threads} threads, all resolved`));
     return out;
+  }
+
+  // A PR's stack: the chain from the PR whose base is not another open PR, down to the last
+  // one built on it. Null when the PR stands alone.
+  stackOf(pr) {
+    const all = this.stacks?.[pr.repo] ?? [];
+    if (!all.length) return null;
+    const byHead = new Map(all.map((p) => [p.headRefName, p]));
+    const me = all.find((p) => p.number === pr.number);
+    if (!me) return null;
+    let root = me;
+    for (let i = 0; i < 40 && byHead.has(root.baseRefName); i++) root = byHead.get(root.baseRefName);
+    const chain = [root];
+    for (let i = 0; i < 40; i++) {
+      const kid = all.find((p) => p.baseRefName === chain.at(-1).headRefName);
+      if (!kid) break;
+      chain.push(kid);
+    }
+    if (chain.length < 2) return null;
+    const at = chain.findIndex((p) => p.number === pr.number);
+    return { chain, at, below: chain[at - 1] ?? null, base: root.baseRefName };
   }
 
   row(pr, section, t, now, selected = false) {
@@ -456,20 +506,34 @@ export default class ReviewDashboard extends View {
       `opened ${ago(pr.created, now)} ago`,
       ...(Math.abs(Date.parse(pr.updated) - Date.parse(pr.created)) > 5 * 60000 ? [`updated ${ago(pr.updated, now)} ago`] : []),
     ];
-    return h_flex().id(`rh-${section.id}-${key}`).px(16).py(12).gap(14).items_center().border_b(1).border_color(t.border)
-      .when(selected, (e) => e.bg(t.selected))
-      .when(!selected, (e) => e.hover((s) => s.bg(t.hover)))
+    // Rows sit inset with rounded corners: hover and selection are soft panels, and the lines
+    // between rows are drawn by the list (none inside a stack, where the rail joins them).
+    return h_flex().id(`rh-${section.id}-${key}`).mx(6).my(2).px(10).py(10).gap(14).items_center().rounded(10)
+      // A hairline frame shows hover and the keys' row on any row, tinted ones included.
+      .border_1().border_color("#00000000")
+      .when(selected, (e) => e.bg(alpha(t.foreground, "0d")).border_color(alpha(t.foreground, "2e")))
+      .when(!selected, (e) => e.hover((s) => s.bg(alpha(t.foreground, "0a")).border_color(alpha(t.foreground, "24"))))
       .when(pr.draft, (e) => e.opacity(0.8))
       .cursor_pointer()
       .on_click(() => this.openPr(pr))
-      .when(Boolean(this.agentState(a, t)?.ready) && !selected, (e) => e.bg(alpha(t.ansi2, "0d")))
-      .child(div().w(3).h(36).rounded(2).flex_none().bg(selected ? t.accent : this.agentState(a, t)?.ready ? t.ansi2 : "#00000000"))
+      .when(Boolean(this.agentState(a, t)?.ready) && !selected, (e) => e.bg(alpha(t.ansi2, "0a")))
+      // A green mark only for a review that is ready; the row the keys are on is shown by its
+      // soft background alone (an accent bar there read as a warning).
+      .child(div().w(3).h(36).rounded(2).flex_none().bg(this.agentState(a, t)?.ready ? t.ansi2 : "#00000000"))
       .child(this.avatar(pr.author, t))
       .child(v_flex().flex_1().min_w(0).gap(5)
         .child(h_flex().gap(8).items_center().min_w(0)
           .when(!section.repo, (e) => e.child(this.chip(pr.repo.split("/")[1], t.muted, t)))
           .when(Boolean(tag), (e) => e.child(div().flex_none().px(5).h(18).flex().items_center().rounded(4).border_1().border_color(t.input).text_size(10.5).text_color(t.muted).child(tag)))
           .child(div().min_w(0).truncate().text_size(13.5).font_semibold().text_color(t.foreground).child(title))
+          .when(Boolean(this.stackOf(pr)), (e) => {
+            const st = this.stackOf(pr);
+            const tip = `Stack on ${st.base}:\n${st.chain.map((p, i) => `${i === st.at ? "▸" : " "} ${i + 1}. #${p.number} ${p.title}`).join("\n")}`;
+            return e.child(h_flex().id(`rh-stack-${key}`).flex_none().gap(4).items_center().px(6).h(18).rounded(4).text_size(10.5)
+              .bg(alpha(t.ansi5 ?? t.accent, "1f")).text_color(t.ansi5 ?? t.accent).tooltip(tip)
+              .child(svg("mods/workspace-chrome/layers.svg").size(10).text_color(t.ansi5 ?? t.accent))
+              .child(div().child(`${st.at + 1}/${st.chain.length}${st.below ? ` · on #${st.below.number}` : ""}`)));
+          })
           .when(pr.draft, (e) => e.child(this.chip("Draft", t.dim, t)))
           .when(fresh && !pr.draft, (e) => e.child(this.chip("New", t.accent, t, "Opened in the last 3 hours")))
           .when(Boolean(a), (e) => e.child(this.agentChip(a, t))))
@@ -500,8 +564,23 @@ export default class ReviewDashboard extends View {
       const list = (this.data[tb.section] ?? []).filter((p) => !tb.repo || p.repo === tb.repo)
         .map((p, i) => [p, i]).sort((x, y) => (x[0].draft - y[0].draft) || (x[1] - y[1])).map(([p]) => p);
       const hide = tb.review && !this.showDrafts;
-      return { ...tb, list: hide ? list.filter((p) => !p.draft) : list, drafts: list.filter((p) => p.draft).length, hidden: hide };
+      const shown = this.groupStacks(hide ? list.filter((p) => !p.draft) : list);
+      return { ...tb, list: shown, drafts: list.filter((p) => p.draft).length, hidden: hide };
     });
+  }
+
+  // PRs of one stack next to each other, in the stack's order, where its first one stood.
+  groupStacks(list) {
+    const out = [], placed = new Set();
+    for (const p of list) {
+      if (placed.has(p)) continue;
+      const st = this.stackOf(p);
+      if (!st) { out.push(p); placed.add(p); continue; }
+      const mates = list.filter((q) => !placed.has(q) && q.draft === p.draft && this.stackOf(q)?.chain[0].number === st.chain[0].number);
+      mates.sort((a, b) => this.stackOf(a).at - this.stackOf(b).at);
+      for (const q of mates) { out.push(q); placed.add(q); }
+    }
+    return out;
   }
 
   pickTab(id, cx) {
@@ -559,12 +638,42 @@ export default class ReviewDashboard extends View {
       .child(div().text_color(t.dim).child(about));
     const groups = [];
     this.rowItem = [];
-    tb.list.forEach((pr, i) => {
+    for (let i = 0; i < tb.list.length; i++) {
+      const pr = tb.list[i];
       if (i === 0 && !pr.draft) groups.push(heading(tb.review ? "Ready for review" : "Open", ready, ""));
       if (pr.draft && (i === 0 || !tb.list[i - 1].draft)) groups.push(heading("Drafts", tb.list.length - ready, "· still being worked on"));
+      // A stack: a header, then its PRs on a rail like a branch graph, a node per PR, from the
+      // one on the base branch at the top to the last one built on it.
+      const st = this.stackOf(pr);
+      const same = (q) => q && q.draft === pr.draft && this.stackOf(q)?.chain[0].number === st?.chain[0].number;
+      const first = Boolean(st) && !same(tb.list[i - 1]), last = Boolean(st) && !same(tb.list[i + 1]);
+      const tone = t.ansi5 ?? t.accent;
+      // A thin line between rows, inset like them; none between rows of one stack.
+      if (i > 0 && !(st && !first)) groups.push(div().mx(16).h(1).bg(alpha(t.foreground, "0f")));
+      if (st && first) {
+        const n = tb.list.filter(same).length;
+        groups.push(h_flex().px(16).pt(12).pb(4).gap(8).items_center()
+          .child(div().size(22).flex_none().rounded(6).bg(alpha(tone, "24")).flex().items_center().justify_center()
+            .child(svg("mods/workspace-chrome/layers.svg").size(12).text_color(tone)))
+          .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child("Stack"))
+          .child(h_flex().gap(4).items_center().min_w(0).text_size(11.5).text_color(t.dim)
+            .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none().text_color(t.dim))
+            .child(div().min_w(0).truncate().font_family("JetBrains Mono").child(st.base)))
+          .child(div().flex_1())
+          .child(div().flex_none().px(7).h(20).flex().items_center().rounded(10).bg(alpha(tone, "1a")).text_size(11).text_color(tone)
+            .child(n === st.chain.length ? `${n} PRs` : `${n} of ${st.chain.length} waiting for you`)));
+      }
       this.rowItem[i] = groups.length;
-      groups.push(this.row(pr, tb, t, now, i === sel));
-    });
+      const row = this.row(pr, tb, t, now, i === sel);
+      if (!st) { groups.push(row); continue; }
+      // The rail continues through the gap between rows, so the dot sits on the row's middle.
+      const line = alpha(tone, "66");
+      const rail = v_flex().w(22).flex_none().items_center()
+        .child(div().w(2).flex_1().bg(first ? "#00000000" : line))
+        .child(div().size(10).flex_none().rounded(5).border_2().border_color(tone).bg(i === sel ? tone : t.background))
+        .child(div().w(2).flex_1().bg(last ? "#00000000" : line));
+      groups.push(h_flex().w_full().items_stretch().pl(10).child(rail).child(div().flex_1().min_w(0).child(row)));
+    }
     // Each item measured, so keys know where a PR sits in the list.
     const st = this.list;
     st.heights.length = groups.length;

@@ -9,6 +9,24 @@ import { exec, hc, home, props, theme, settings, shared, setShared, focused, pan
 // and cards get a faint tint of their own, since its surface is opaque for tooltips.
 const glassy = (t) => (t.background ?? "").length === 9;
 // A color at some opacity, whether it came as #rrggbb or already #rrggbbaa.
+// GitHub's emoji shortcodes (:tada:) as characters, from its emoji list: a Unicode emoji's
+// image name is its code points. Read once per run; custom ones (:octocat:) stay as text.
+const EMOJI = exec("gh", ["api", "emojis"]).then((r) => {
+  const map = new Map();
+  try {
+    for (const [name, url] of Object.entries(JSON.parse(r.stdout || "{}"))) {
+      const m = /\/unicode\/([0-9a-f-]+)\.png/.exec(String(url));
+      if (m) map.set(name, String.fromCodePoint(...m[1].split("-").map((h) => parseInt(h, 16))));
+    }
+  } catch {}
+  return map;
+}).catch(() => new Map());
+let EMOJI_MAP = null;
+EMOJI.then((m) => { EMOJI_MAP = m; });
+const emojify = (text) => !EMOJI_MAP?.size || !text ? text
+  : String(text).split(/(\x60\x60\x60[\s\S]*?\x60\x60\x60|\x60[^\x60\n]*\x60)/).map((part) => part.startsWith("\x60") ? part
+    : part.replace(/:([a-z0-9_+-]+):/g, (all, name) => EMOJI_MAP.get(name) ?? all)).join("");
+
 // Your GitHub login, to find your own review among the PR's.
 const ME = exec("gh", ["api", "user", "-q", ".login"]).then((r) => (r.code === 0 ? r.stdout.trim() : "")).catch(() => "");
 // Where your review of each PR stands, for the sidebar: { "owner/repo#123": { state, at } }.
@@ -1166,6 +1184,57 @@ export default class PrDiff extends View {
     });
   }
 
+  // The PR's stack: every open PR of the repo by head and base branch, walked down to the PR
+  // based on a branch no open PR has, then up through the ones built on each.
+  loadStack() {
+    if (!this.repo) return;
+    exec("gh", ["pr", "list", "--repo", this.repo, "--state", "open", "--limit", "200", "--json", "number,headRefName,baseRefName,title,url"]).then((r) => {
+      let all = [];
+      try { all = JSON.parse(r.stdout || "[]"); } catch {}
+      const byHead = new Map(all.map((p) => [p.headRefName, p]));
+      let root = all.find((p) => p.number === this.number);
+      if (!root) { this.stack = null; return; }
+      for (let i = 0; i < 40 && byHead.has(root.baseRefName); i++) root = byHead.get(root.baseRefName);
+      const chain = [root];
+      for (let i = 0; i < 40; i++) {
+        const kid = all.find((p) => p.baseRefName === chain.at(-1).headRefName);
+        if (!kid) break;
+        chain.push(kid);
+      }
+      this.stack = chain.length > 1 ? { chain, base: root.baseRefName } : null;
+      setShared("pr-diff.redraw", Date.now());
+    }).catch(() => {});
+  }
+
+  // Another PR of the stack in a tab of its own, next to this one.
+  openStackPr(p) {
+    const name = `#${p.number}`;
+    const me = focused();
+    const space = spaces().find((x) => x.tabs.some((tb) => tb.id === me?.tab)) ?? spaces().find((x) => x.active);
+    const tab = space?.tabs.find((tb) => tb.name === name);
+    if (tab) { run("tab.select", { id: tab.id }); return; }
+    run("tab.new", { space: space?.id, name, mod: "pr-diff", props: { repo: this.repo, number: p.number, url: p.url } });
+  }
+
+  // The stack as a row of PR chips under the header: this one marked, a click opens another.
+  stackRow(t) {
+    const st = this.stack;
+    if (!st) return null;
+    const at = st.chain.findIndex((p) => p.number === this.number);
+    const tone = t.ansi5 ?? t.accent;
+    return h_flex().id("pr-stack").flex_none().gap(4).items_center().pl(46).pb(8).flex_wrap()
+      .child(h_flex().gap(5).items_center().pr(4).text_size(11).text_color(t.dim)
+        .child(svg("mods/workspace-chrome/layers.svg").size(11).text_color(tone))
+        .child(div().child(`Stack ${at + 1}/${st.chain.length} on ${st.base}`)))
+      .children(st.chain.map((p, i) => h_flex().id(`pr-stack-${p.number}`).gap(4).items_center()
+        .when(i > 0, (e) => e.child(div().text_size(10.5).text_color(t.dim).child("›")))
+        .child(div().px(6).h(20).flex().items_center().rounded(5).text_size(11)
+          .when(i === at, (e) => e.bg(alpha(tone, "2e")).text_color(tone).font_semibold())
+          .when(i !== at, (e) => e.text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(() => this.openStackPr(p)))
+          .tooltip(`#${p.number} ${p.title}`)
+          .child(`#${p.number}`))));
+  }
+
   // Your latest review on this PR, if any: { state, at }.
   myReview() {
     if (!this.me) return null;
@@ -1235,6 +1304,7 @@ export default class PrDiff extends View {
         if (view.code === 0) this.info = JSON.parse(view.stdout);
         this.conversation = conversationOf(this.info);
         this.publishMine();
+        this.loadStack();
         // Bots and minimized comments start folded.
         this.convFolded ??= new Set(this.conversation.filter((c) => c.bot || c.minimized).map((c) => c.id));
         try {
@@ -1328,7 +1398,7 @@ export default class PrDiff extends View {
   }
 
   richBody(text, key, t, maxW = 860, live = true) {
-    return v_flex().w_full().children(bodyParts(live ? this.linkFiles(text) : text).map((p, i) =>
+    return v_flex().w_full().children(bodyParts(emojify(live ? this.linkFiles(text) : text)).map((p, i) =>
       p.table ? this.tablePart(p.table, `${key}-${i}`, t, maxW, live)
       : p.video ? this.videoPart(p.video, `${key}-${i}`, t, live, maxW)
       : p.image !== undefined ? this.imagePart(p, `${key}-${i}`, t, maxW, 560, live)
@@ -2439,6 +2509,7 @@ export default class PrDiff extends View {
           .child(button("gh", "GitHub ↗", () => exec("open", [this.url]).catch(() => {})))
           .child(this.mineChip(t))
           .child(this.agentButton(t))))
+      .when(Boolean(this.stack), (e) => e.child(this.stackRow(t)))
       .child(h_flex().h(26).flex_none().gap(16).items_center().min_w(0).pl(46)
         .when(Boolean(ciFact), (e) => e.child(ciFact))
         .when(approvals > 0, (e) => e.child(fact(t.ansi2, `${approvals} approved`, null)))

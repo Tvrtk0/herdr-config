@@ -183,11 +183,14 @@ print(json.dumps({"entries": out[-400:], "partial": size > want, "size": size, "
 // Prose and fenced code apart, so each code block can carry a copy button.
 function pieces(text) {
   const out = [];
-  const re = /^(\x60{3,}|~{3,})[^\n]*\n[\s\S]*?^\1[ \t]*$/gm;
+  // A fence may be indented (code inside a list item): the same indent comes off its lines.
+  const re = /^([ \t]*)(\x60{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\2[ \t]*$/gm;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) out.push({ code: false, text: text.slice(last, m.index) });
-    const body = m[0].replace(/^[^\n]*\n/, "").replace(/\n[^\n]*$/, "");
+    const pad = m[1].length;
+    const body = m[0].replace(/^[^\n]*\n/, "").replace(/\n[^\n]*$/, "")
+      .split("\n").map((l) => l.slice(Math.min(pad, l.length - l.trimStart().length))).join("\n");
     out.push({ code: true, text: m[0], body });
     last = m.index + m[0].length;
   }
@@ -461,6 +464,12 @@ function vimInsert(v, text) {
   v.row += parts.length - 1; v.col = last.length;
 }
 
+// A reply as plain text to paste: code fences, backticks, bold and heading marks gone.
+function plainOf(text) {
+  return String(text ?? "").replace(/^[\x60~]{3,}.*$/gm, "").replace(/\x60([^\x60\n]*)\x60/g, "$1")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1").replace(/^#{1,6} /gm, "").replace(/^>\s?/gm, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 export default class ClaudeReader extends View {
   init(_props, cx) {
     this.entries = [];
@@ -663,7 +672,7 @@ export default class ClaudeReader extends View {
     const text = (x.text ?? "").replace(/\[Image #\d+\]\s*/g, "").trim();
     return h_flex().w_full().justify_end().child(
       v_flex().max_w(620).gap(8).px(14).py(10).rounded(14).bg(alpha(t.accent, "24")).border_1().border_color(alpha(t.accent, "40"))
-        .text_size(13.5).text_color(t.foreground)
+        .text_size(props()?.overlay ? 15 : 13.5).when(Boolean(props()?.overlay), (e) => e.line_height(1.55)).text_color(t.foreground)
         .when((x.images ?? []).length > 0, (e) => e.child(h_flex().gap(8).flex_wrap().children(x.images.map((p) => this.picture(p, 280, t)))))
         .when(Boolean(text), (e) => e.child(TextView.markdown(`rd-you-${x.id}`, text).selectable(true))));
   }
@@ -676,19 +685,36 @@ export default class ClaudeReader extends View {
 
   text(x, t) {
     const link = (v) => v.on_link_click((url) => exec("open", [url]).catch(() => {}));
-    return v_flex().w_full().gap(10).text_size(14).text_color(t.foreground)
-      .children(pieces(x.text).map((p, i) => {
+    // Reading mode reads like a page: taller lines, more air between parts, and each heading
+    // starts a block of its own with room above it.
+    const page = Boolean(props()?.overlay);
+    const parts = page
+      ? pieces(x.text).flatMap((p) => p.code || p.quote ? [p] : p.text.split(/\n(?=#{1,4} )/).map((text) => ({ code: false, text, head: /^#{1,4} /.test(text) })))
+      : pieces(x.text);
+    return v_flex().w_full().gap(page ? 16 : 10).text_size(page ? 15.5 : 14).when(page, (e) => e.line_height(1.65)).text_color(t.foreground)
+      .children(parts.map((p, i) => {
         const key = `${x.id}-${i}`;
-        if (!p.code && !p.quote) return link(TextView.markdown(`rd-${key}`, p.text).selectable(true));
+        if (!p.code && !p.quote) return div().w_full().when(page && Boolean(p.head) && i > 0, (e) => e.pt(12)).child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true)));
         return div().w_full().relative()
           // A quote keeps clear of the button on its right.
           .child(div().w_full().when(Boolean(p.quote), (q) => q.pr(70)).child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true))))
-          .child(div().id(`rd-copy-${key}`).absolute().top(8).right(8).px(8).h(22).flex().items_center().rounded(6)
-            .bg(t.popover).border_1().border_color(t.border).text_size(11).text_color(this.copied === key ? t.ansi2 : t.muted)
-            .cursor_pointer().hover((s) => s.text_color(t.foreground))
-            .on_click((_e, cx) => { cx.stop_propagation(); this.copy(p.body, key, cx); cx.notify(); })
-            .child(this.copied === key ? "Copied" : "Copy"));
-      }));
+          .child(this.copyButton(`rd-copy-${key}`, p.body, key, t, true));
+      }))
+      // The whole answer, as plain text, under it.
+      .when(page && Boolean(x.text?.trim()), (e) => e.child(h_flex().justify_end().child(this.copyButton(`rd-copyall-${x.id}`, plainOf(x.text), `all-${x.id}`, t, false, "Copy answer"))));
+  }
+
+  // A copy button: an icon and a word, quiet until hovered, green "Copied" for a moment.
+  copyButton(id, text, key, t, floating, label = "Copy") {
+    const done = this.copied === key;
+    const ink = done ? t.ansi2 : t.dim;
+    return h_flex().id(id).gap(5).items_center().px(7).h(22).rounded(6).cursor_pointer().text_size(11)
+      .when(floating, (e) => e.absolute().top(8).right(8).bg(alpha(t.popover, "e6")).border_1().border_color(alpha(t.foreground, "14")))
+      .text_color(ink)
+      .hover((s) => s.text_color(t.foreground).bg(alpha(t.foreground, "10")))
+      .on_click((_e, cx) => { cx.stop_propagation(); this.copy(text, key, cx); cx.notify(); })
+      .child(svg(done ? "mods/workspace-chrome/check.svg" : "icons/aside-copy.svg").size(12).flex_none().text_color(ink))
+      .child(div().child(done ? "Copied" : label));
   }
 
   tools(x, t) {
@@ -810,6 +836,17 @@ export default class ClaudeReader extends View {
   // produced, the active one with the tool running under it), and once it is finished a card
   // of what was done, whether it was tested, what is left for you and the files changed.
   // Without a plan (a short request) the turn's tools stand in for it.
+  // Hands a next step to plan-steps in Claude Code, which puts it in the prompt (never sends).
+  pickNext(text, cx) {
+    const t = this.terminal();
+    if (!t) return;
+    const path = `${appHome()}/data/next/${t}.json`;
+    exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1"', "sh", path, JSON.stringify({ text, at: Date.now() })]).catch(() => {});
+    this.nextFilled = text;
+    cx.timer.after(4000, (cx) => { if (this.nextFilled === text) { this.nextFilled = null; cx.notify(); } });
+    cx.notify();
+  }
+
   notesPath() {
     const id = (this.file ?? "").split("/").pop()?.replace(/\.jsonl$/, "");
     return id ? `${home()}/.claude/state/notes/${id}.md` : null;
@@ -957,6 +994,8 @@ export default class ClaudeReader extends View {
     for (const x of [...this.entries].reverse()) { if (x.k === "you") break; if (x.k === "text") { said = x.text; break; } }
     const lead = status === "blocked" ? "Waiting for your answer or permission in the terminal."
       : working && active ? active.title
+      // Finished with a wrap-up: the Done card below says it, so the state card stays one line.
+      : wrap ? null
       : sentence(said);
     const mono = settings().font_family ?? "JetBrains Mono";
 
@@ -1088,13 +1127,22 @@ export default class ClaudeReader extends View {
           .when(Boolean(wrap.forYou), (el) => el.child(v_flex().gap(3).p(10).rounded(8).bg(alpha(t.blocked, "1a")).border_1().border_color(alpha(t.blocked, "4d"))
             .child(div().text_size(11).font_semibold().text_color(t.blocked).child("FOR YOU"))
             .child(div().text_size(12.5).text_color(t.foreground).child(wrap.forYou))))
-          // Likely next steps: a number in the prompt picks one; nothing starts on its own.
-          .when(Boolean(wrap.next?.length), (el) => el.child(v_flex().gap(4)
-            .child(h_flex().gap(8).items_center().child(div().text_size(11).font_semibold().text_color(t.dim).child("NEXT"))
-              .child(div().text_size(10.5).text_color(t.dim).child("type its number in the prompt")))
-            .children(wrap.next.map((x, k) => h_flex().gap(8).items_start().text_size(12.5)
-              .child(div().flex_none().w(16).h(16).rounded(4).bg(t.raised).flex().items_center().justify_center().text_size(10.5).text_color(t.muted).child(String(k + 1)))
-              .child(div().flex_1().min_w(0).text_color(t.foreground).child(x))))))));
+          // Likely next steps: a click puts one in Claude's prompt (plan-steps fills it), a number
+          // typed in the prompt picks one too; nothing is sent on its own.
+          .when(Boolean(wrap.next?.length), (el) => el.child(v_flex().gap(6).pt(4)
+            .child(h_flex().gap(8).items_center()
+              .child(div().text_size(11).font_semibold().text_color(t.dim).child("NEXT"))
+              .child(div().flex_1().h(1).bg(t.border))
+              .child(div().text_size(10.5).text_color(this.nextFilled ? t.ansi2 : t.dim).child(this.nextFilled ? "In the prompt, press enter" : "click to put it in the prompt")))
+            .children(wrap.next.map((x, k) => h_flex().id(`sd-next-${k}`).gap(10).items_center().px(10).py(8).rounded(8).cursor_pointer()
+              .border_1().border_color(this.nextFilled === x ? alpha(t.ansi2, "80") : t.border)
+              .bg(this.nextFilled === x ? alpha(t.ansi2, "14") : alpha(t.foreground, "05"))
+              .hover((s) => s.bg(alpha(t.accent ?? t.ansi4, "14")).border_color(alpha(t.accent ?? t.ansi4, "66")))
+              .on_click((_e, cx) => this.pickNext(x, cx))
+              .child(div().flex_none().size(20).rounded(6).bg(alpha(t.accent ?? t.ansi4, "26")).flex().items_center().justify_center()
+                .text_size(11).font_semibold().text_color(t.accent ?? t.ansi4).child(String(k + 1)))
+              .child(div().flex_1().min_w(0).text_size(12.5).text_color(t.foreground).child(x))
+              .child(div().flex_none().text_size(12).text_color(t.dim).child("↵"))))))));
     col = col
         // Files changed in this request
         .when(files.size > 0, (e) => e.child(v_flex().gap(4)
@@ -1388,18 +1436,33 @@ export default class ClaudeReader extends View {
       const i = logs.findLastIndex((l) => `/${l.command}` === x.name || l.command === x.name.replace(/^\//, ""));
       if (i >= 0) { outFor.set(x.id, logs[i]); logs.splice(i, 1); }
     }
-    const body = v_flex().w_full().max_w(820).mx_auto().px(28).pt(22).pb(32).gap(24)
+    // In reading mode a narrower column: about 75 characters a line.
+    const body = v_flex().w_full().max_w(props()?.overlay ? 740 : 820).mx_auto().px(28).pt(22).pb(32).gap(props()?.overlay ? 32 : 24)
       .when(Boolean(this.partial), (e) => e.child(h_flex().justify_center().child(
         div().id("rd-more").px(10).h(26).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted)
           .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((_e, cx) => { this.bytes = Math.min(MAX_BYTES, this.bytes * 2); this.follow = false; this.poll(cx, true); })
           .child("Show earlier"))))
       .when(Boolean(this.error), (e) => e.child(div().text_size(12.5).text_color(t.blocked).child(this.error)))
-      .children(this.entries.map((x) => div().id(`rd-e-${x.id}`).w_full()
+      // Only what is near the screen is drawn in full: an entry already measured and more than a
+      // screen away is an empty box of its height, so a long chat scrolls without redrawing every
+      // answer's markdown on each step of the wheel.
+      .children((() => {
+        const gap = props()?.overlay ? 32 : 24;
+        let y = 22 + (this.partial ? 26 + gap : 0);
+        const lo = st.off - st.view * 1.5, hi = st.off + st.view * 2.5;
+        return this.entries.map((x) => {
+          const h = this.heights[x.id];
+          const top = y;
+          y += (h ?? 120) + gap;
+          if (h != null && st.view > 0 && (top + h < lo || top > hi)) return div().id(`rd-e-${x.id}`).w_full().h(h);
+          return null;
+        });
+      })().map((ph, k) => ph ?? (() => { const x = this.entries[k]; return div().id(`rd-e-${x.id}`).w_full()
         .on_size_change((size) => { this.heights[x.id] = size.height; })
         .child(x.k === "you" ? this.you(x, t) : x.k === "text" ? this.text(x, t)
         : x.k === "cmd" ? this.command(x, t, outFor)
-        : x.k === "note" ? h_flex().justify_end().text_size(11.5).text_color(t.dim).child(x.text) : this.toolPictures(x, t))))
+        : x.k === "note" ? h_flex().justify_end().text_size(11.5).text_color(t.dim).child(x.text) : this.toolPictures(x, t)); })()))
       .child(this.live(t, status) ?? div());
 
     const thumb = st.full > st.view + 1 && st.view > 0;
@@ -1423,7 +1486,11 @@ export default class ClaudeReader extends View {
       .when(part === "reading", (e) => e.child(this.toc(t)))
       .child(div().id("rd-view").flex_1().min_w(0).h_full().relative().overflow_hidden()
         .on_size_change((size, cx) => { if (Math.abs(size.height - st.view) >= 1) { st.view = size.height; cx.notify(); } })
-        .on_scroll_wheel((e, cx) => { this.stopGlide(); this.scrollBy(-(e.delta?.y ?? 0)); cx.stop_propagation(); cx.notify(); })
+        .on_scroll_wheel((e, cx) => {
+          this.stopGlide(); this.scrollBy(-(e.delta?.y ?? 0)); cx.stop_propagation();
+          // Many wheel events land in one frame: one redraw for all of them.
+          if (!this.wheelQueued) { this.wheelQueued = true; cx.timer.after(0, (cx) => { this.wheelQueued = false; cx.notify(); }); }
+        })
         .child(div().id("rd-content").absolute().left(0).w_full().top(-st.off)
           .on_size_change((size, cx) => { if (Math.abs(size.height - st.full) >= 1) { st.full = size.height; cx.notify(); } })
           .child(body))
