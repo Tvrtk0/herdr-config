@@ -164,6 +164,8 @@ export default class ReviewDashboard extends View {
           ...(data.waiting ?? []).filter((p) => !only.has(p.repo)),
           ...SECTIONS.filter((x) => x.id.startsWith("only:")).flatMap((x) => data[x.id] ?? []),
         ].filter((p) => !p.draft);
+        // Your own open PRs, for the small list above Review in the sidebar.
+        setShared("review.own", { at: Date.now(), prs: (data.mine ?? []).map((p) => ({ number: p.number, title: p.title, url: p.url, updatedAt: p.updated, createdAt: p.created, draft: p.draft, approvals: p.approvals, changes: p.changes, openThreads: p.openThreads, ci: p.ci, repository: { nameWithOwner: p.repo } })) });
         setShared("review.feed", { at: Date.now(), prs: waiting.map((p) => ({ number: p.number, title: p.title, url: p.url, updatedAt: p.updated, repository: { nameWithOwner: p.repo }, author: { login: p.author } })) });
         // Stacks: every open PR of these repos, head and base branches, one cheap list per repo.
         const repos = [...new Set(Object.values(data).flat().map((p) => p.repo))];

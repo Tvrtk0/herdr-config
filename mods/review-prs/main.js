@@ -390,7 +390,36 @@ export default class ReviewPrs extends View {
             .child(div().flex_none().text_size(10.5).text_color(t.dim).child(age(pr.updatedAt, now))),
         );
     };
-    const rows = repos.map(card);
+    // Your own open PRs (the dashboard's list), the newest opened first: one line each with what it waits on.
+    const own = [...(shared("review.own")?.prs ?? [])].sort((a, b) => Date.parse(b.createdAt ?? b.updatedAt) - Date.parse(a.createdAt ?? a.updatedAt));
+    const ciColor = { SUCCESS: t.ansi2, FAILURE: t.ansi1, ERROR: t.ansi1, PENDING: t.working, EXPECTED: t.working };
+    const ownRow = (pr) => h_flex()
+      .id(`rp-own-${pr.url}`)
+      .h(26)
+      .px(8)
+      .gap(7)
+      .flex_none()
+      .items_center()
+      .rounded(6)
+      .text_size(12)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .tooltip(`${pr.title}\n${pr.repository.nameWithOwner} · ${pr.ci ? `checks ${pr.ci.toLowerCase()}` : "no checks"}`)
+      .on_click(() => this.diff(pr))
+      .child(div().size(6).flex_none().rounded(3).bg(ciColor[pr.ci] ?? t.dim))
+      .child(div().flex_none().text_color(t.dim).child(`#${pr.number}`))
+      .child(div().flex_1().min_w(0).truncate().text_color(pr.draft ? t.muted : t.foreground).child(short(pr.title)))
+      .when(Boolean(pr.draft), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child("draft")))
+      .when(pr.changes > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi1).tooltip("Changes requested").child("±")))
+      .when(pr.openThreads > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.muted).tooltip(`${pr.openThreads} open threads`).child(`💬${pr.openThreads}`)))
+      .when(pr.approvals > 0, (el) => el.child(div().flex_none().text_size(11).text_color(t.ansi2).tooltip(`${pr.approvals} approvals`).child(`✓${pr.approvals}`)));
+    const label = (text, n) => h_flex().h(24).px(8).gap(6).flex_none().items_center().text_size(11.5).font_medium().text_color(t.dim)
+      .child(div().child(text)).when(n > 0, (el) => el.child(div().text_size(11).child(String(n))));
+    const rows = [
+      // Your rows sit close together (the list's gap is for the cards below).
+      ...(own.length ? [v_flex().flex_none().children(own.map(ownRow)), label("Review", todo.length)] : []),
+      ...repos.map(card),
+    ];
 
     const refresh = this.loading
       ? svg("mods/workspace-chrome/spinner.svg").size(15).flex_none().text_color(t.dim).spin(900)
@@ -427,8 +456,8 @@ export default class ReviewPrs extends View {
             h_flex()
               .gap(6)
               .items_center()
-              .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Review"))
-              .when(todo.length > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(todo.length)))),
+              .child(div().text_size(11.5).font_medium().text_color(t.dim).child(own.length ? "Your PRs" : "Review"))
+              .when((own.length || todo.length) > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(own.length || todo.length)))),
           )
           .child(
             h_flex()

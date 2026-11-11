@@ -11,6 +11,21 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, TextView } from "gpui-base";
 import { exec, hc, home, appHome, props, theme, panes, readTextFile, nextCommand, settings, run, shared, setShared, focused, agents, closeOverlay, openOverlay, layout } from "herdr";
 
+// Text faces reading mode can wear, all shipped with macOS: Herdr's own, two modern serifs
+// made for screens, two classic book serifs and a humanist sans.
+const READ_FONTS = [null, "New York", "Charter", "Iowan Old Style", "Georgia", "Avenir Next"];
+
+// The Claude session in a terminal, from the file the session-bridge mod keeps on the Claude
+// Code side (~/.claude/state/session/<terminal>.json). Null when there is none (an older
+// session, outside Herdr): then the walk through the terminal's processes is the fallback.
+async function bridged(terminal) {
+  if (!terminal) return null;
+  try {
+    const s = JSON.parse((await readTextFile(`${home()}/.claude/state/session/${terminal}.json`)) ?? "null");
+    return s?.sessionId && s?.transcript ? s : null;
+  } catch { return null; }
+}
+
 // Where the side pane asks the chat pane to scroll: { terminal, id, at }.
 const JUMP_KEY = "claude-reader.jump";
 
@@ -85,6 +100,7 @@ def change(name, i):
     if name == "NotebookEdit": return {"file": f, "add": lines_of(i.get("new_source")), "del": 0}
     return None
 import re
+
 agent_by_id = {}
 for line in lines:
     try: r = json.loads(line)
@@ -560,6 +576,8 @@ export default class ClaudeReader extends View {
   }
 
   async findFile() {
+    const b = await bridged(this.terminal());
+    if (b) return b.transcript;
     const got = await hc(["get", this.terminal() ?? "", "--json"]);
     const pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
     const session = pid ? JSON.parse((await readTextFile(`${home()}/.claude/sessions/${pid}.json`)) ?? "null") : null;
@@ -834,7 +852,8 @@ export default class ClaudeReader extends View {
     return v_flex().id("rd-toc").w(250).flex_none().h_full().min_h(0).border_r(1).border_color(t.border).overflow_y_scrollbar()
       .child(v_flex().px(10).py(14).gap(2)
         .child(div().px(8).pb(6).text_size(11).font_semibold().text_color(t.dim).child(`PROMPTS · ${you.length}`))
-        .children(you.map((x) => {
+        // Newest on top.
+        .children([...you].reverse().map((x) => {
           const on = x.id === here;
           return div().id(`rd-tc-${x.id}`).px(8).py(6).rounded(6).cursor_pointer().text_size(12)
             .when(on, (el) => el.bg(t.selected))
@@ -1366,6 +1385,12 @@ export default class ClaudeReader extends View {
 
   // The session at a glance, on top of the page: what it is about, the model and effort,
   // lines changed, the limits, the context and the turn.
+  // Reading mode's text face, tried in turn from the bar (code keeps the mono font).
+  readFont() {
+    if (this.fontAt == null) { try { this.fontAt = Number(localStorage.getItem("readFont") ?? 0) || 0; } catch { this.fontAt = 0; } }
+    return READ_FONTS[this.fontAt % READ_FONTS.length];
+  }
+
   bar(t, p) {
     const line = this.line;
     const status = p?.status;
@@ -1406,6 +1431,17 @@ export default class ClaudeReader extends View {
         .child(`${line.model.display_name}${line.effort?.level ? ` · ${line.effort.level}` : ""}`)))
       .when(Boolean(ask), (e) => e.child(chip(`🔒 ${ask}`, t.working, "Read-only: /ask off to leave")))
       .child(div().flex_1())
+      .child(h_flex().id("rd-font").flex_none().gap(6).items_center().px(8).h(22).rounded(6).text_size(11).text_color(t.muted).cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .tooltip("Next reading font")
+        .on_click((_e, cx) => {
+          this.fontAt = (this.fontAt + 1) % READ_FONTS.length;
+          try { localStorage.setItem("readFont", String(this.fontAt)); } catch {}
+          this.heights = {};
+          cx.notify();
+        })
+        .child(div().font_semibold().when(Boolean(this.readFont()), (x) => x.font_family(this.readFont())).child("Aa"))
+        .child(div().child(this.readFont() ?? "Default")))
       .when(Boolean(added || removed), (e) => e.child(h_flex().flex_none().gap(5).text_size(11)
         .child(div().text_color(t.ansi2).child(`+${added ?? 0}`)).child(div().text_color(t.ansi1).child(`−${removed ?? 0}`))))
       .child(lim("5h", line?.rate_limits?.five_hour) ?? div())
@@ -1450,7 +1486,8 @@ export default class ClaudeReader extends View {
       if (i >= 0) { outFor.set(x.id, logs[i]); logs.splice(i, 1); }
     }
     // In reading mode a narrower column: about 75 characters a line.
-    const body = v_flex().w_full().max_w(props()?.overlay ? 740 : 820).mx_auto().px(28).pt(22).pb(32).gap(props()?.overlay ? 32 : 24)
+    const font = props()?.overlay ? this.readFont() : null;
+    const body = v_flex().w_full().when(Boolean(font), (e) => e.font_family(font)).max_w(props()?.overlay ? 740 : 820).mx_auto().px(28).pt(22).pb(32).gap(props()?.overlay ? 32 : 24)
       .when(Boolean(this.partial), (e) => e.child(h_flex().justify_center().child(
         div().id("rd-more").px(10).h(26).flex().items_center().rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted)
           .cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -1496,6 +1533,7 @@ export default class ClaudeReader extends View {
       .on_mouse_down("left", (_e, cx) => { if (Date.now() - (this.notesClickAt ?? 0) > 100) this.handle.focus(); cx.notify(); })
       .when(part === "reading", (e) => e.bg(t.popover).child(this.bar(t, p)))
       .child(h_flex().flex_1().min_h(0).w_full()
+      .on_size_change((size, cx) => { if (Math.abs(size.width - (this.readW ?? 0)) >= 1) { this.readW = size.width; cx.notify(); } })
       .when(part === "reading", (e) => e.child(this.toc(t)))
       .child(div().id("rd-view").flex_1().min_w(0).h_full().relative().overflow_hidden()
         .on_size_change((size, cx) => { if (Math.abs(size.height - st.view) >= 1) { st.view = size.height; cx.notify(); } })
@@ -1513,6 +1551,10 @@ export default class ClaudeReader extends View {
           .hover((s) => s.text_color(t.foreground))
           .on_click((_e, cx) => { this.follow = true; cx.notify(); })
           .child("↓ To the end"))))
+      // As wide as the prompt list on the left, room allowing: the chat sits in the window's
+      // middle, not the middle of what the list leaves.
+      .when(part === "reading" && this.entries.some((x) => x.k === "you"), (e) =>
+        e.child(div().flex_none().w(Math.max(0, Math.min(250, (this.readW ?? 0) - 250 - 796)))))
       .when(part !== "chat" && part !== "reading", (e) => e.child(this.side(t, status))))
       .when(true, (e) => e.child(h_flex().flex_none().when(!keysHere, (x) => x.opacity(0.45)).px(14).h(24).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().text_color(t.muted).child(title))

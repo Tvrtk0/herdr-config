@@ -8,9 +8,21 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Input, InputState, TextView } from "gpui-base";
 import { exec, hc, home, appHome, props, theme, panes, focused, agents, readTextFile, writeTextFile, closeOverlay } from "herdr";
 
+// The Claude session in a terminal, from the file the session-bridge mod keeps on the Claude
+// Code side (~/.claude/state/session/<terminal>.json). Null when there is none (an older
+// session, outside Herdr): then the walk through the terminal's processes is the fallback.
+async function bridged(terminal) {
+  if (!terminal) return null;
+  try {
+    const s = JSON.parse((await readTextFile(`${home()}/.claude/state/session/${terminal}.json`)) ?? "null");
+    return s?.sessionId && s?.transcript ? s : null;
+  } catch { return null; }
+}
+
 // The end of a transcript as plain lines: what you asked, what Claude said, the tools it ran.
 const CONTEXT = String.raw`
 import json, sys
+
 path, limit = sys.argv[1], int(sys.argv[2])
 with open(path, "rb") as f:
     f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 3000000))
@@ -79,6 +91,8 @@ export default class Aside extends View {
   // Its Claude session: id, folder and transcript, found through the terminal's process.
   async session() {
     if (this.sess) return this.sess;
+    const b = await bridged(this.terminal());
+    if (b) { this.sess = { id: b.sessionId, cwd: b.launchCwd ?? b.cwd, file: b.transcript }; return this.sess; }
     const got = await hc(["get", this.terminal() ?? "", "--json"]);
     let pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
     // While Claude runs a tool the foreground is that tool: walk up to Claude itself.

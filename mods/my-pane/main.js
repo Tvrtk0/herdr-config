@@ -9,6 +9,18 @@ import { View, div, svg, image } from "gpui-kit";
 import { h_flex, Input, InputState } from "gpui-base";
 import { panes, props, run, theme, home, hc, readTextFile, exec, terminals, focused } from "herdr";
 
+// The Claude session in a terminal, from the file the session-bridge mod keeps on the Claude
+// Code side (~/.claude/state/session/<terminal>.json). Null when there is none (an older
+// session, outside Herdr): then the walk through the terminal's processes is the fallback.
+async function bridged(terminal) {
+  if (!terminal) return null;
+  try {
+    const s = JSON.parse((await readTextFile(`${home()}/.claude/state/session/${terminal}.json`)) ?? "null");
+    return s?.sessionId && s?.transcript ? s : null;
+  } catch { return null; }
+}
+
+
 // A color at some opacity, whether it came as #rrggbb or already #rrggbbaa.
 const alpha = (c, a) => (c.length === 9 ? c.slice(0, 7) : c) + a;
 
@@ -144,11 +156,15 @@ export default class Pane extends View {
     this.readAt = Date.now();
     cx.spawn(async (cx) => {
       try {
-        const got = await hc(["get", p.terminal, "--json"]);
-        const pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
-        const session = pid ? JSON.parse((await readTextFile(`${home()}/.claude/sessions/${pid}.json`)) ?? "null") : null;
+        const b = await bridged(p.terminal);
+        let session = b ? { sessionId: b.sessionId, cwd: b.launchCwd ?? b.cwd } : null;
+        if (!session) {
+          const got = await hc(["get", p.terminal, "--json"]);
+          const pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
+          session = pid ? JSON.parse((await readTextFile(`${home()}/.claude/sessions/${pid}.json`)) ?? "null") : null;
+        }
         if (session?.sessionId && session?.cwd) {
-          const file = `${home()}/.claude/projects/${session.cwd.replace(/[^A-Za-z0-9]/g, "-")}/${session.sessionId}.jsonl`;
+          const file = b?.transcript ?? `${home()}/.claude/projects/${session.cwd.replace(/[^A-Za-z0-9]/g, "-")}/${session.sessionId}.jsonl`;
           const tail = await exec("tail", ["-c", String(TAIL_BYTES), file]);
           let model = null, used = null, askedAt = null, spokeAt = null;
           for (const line of (tail.stdout ?? "").split("\n")) {

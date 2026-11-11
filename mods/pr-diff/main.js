@@ -5,6 +5,17 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list, TextView, VirtualListScrollHandle, InputState, Input, TextareaState, Textarea } from "gpui-base";
 import { exec, hc, home, props, theme, settings, shared, setShared, focused, panes, spaces, agents, run, nextCommand, openOverlay, closeOverlay, readTextFile, appHome } from "herdr";
 
+// The Claude session in a terminal, from the file the session-bridge mod keeps on the Claude
+// Code side (~/.claude/state/session/<terminal>.json). Null when there is none (an older
+// session, outside Herdr): then the walk through the terminal's processes is the fallback.
+async function bridged(terminal) {
+  if (!terminal) return null;
+  try {
+    const s = JSON.parse((await readTextFile(`${home()}/.claude/state/session/${terminal}.json`)) ?? "null");
+    return s?.sessionId && s?.transcript ? s : null;
+  } catch { return null; }
+}
+
 // A see-through look (glass) has a translucent background: panes let it show through,
 // and cards get a faint tint of their own, since its surface is opaque for tooltips.
 const glassy = (t) => (t.background ?? "").length === 9;
@@ -539,6 +550,7 @@ const VIEWED_KEY = "pr-diff.viewed";
 // (a diff this big is too much for exec's output).
 const CHANGES_SCRIPT = String.raw`
 import json, os, re, subprocess, sys
+
 tp, cwd, theme, dest = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 os.makedirs(os.path.dirname(dest), exist_ok=True)
 home = os.path.expanduser("~")
@@ -796,6 +808,10 @@ export default class PrDiff extends View {
           const last = this.drafts.lastBlocks;
           this.drafts.talk = (got.turns ?? []).filter((x) => (x.role === "user" ? x.at > last : x.at > last)).slice(-12);
           for (const n of [...this.chosen]) if (!this.drafts.list.some((d) => d.n === n)) this.chosen.delete(n);
+          // How many drafts this PR has, for the sidebar's chip (it cannot parse the prose itself).
+          const key = `${this.repo}#${this.number}`;
+          const counts = shared("review.draftCount") ?? {};
+          if (counts[key] !== this.drafts.list.length) setShared("review.draftCount", { ...counts, [key]: this.drafts.list.length });
         }
       } catch (e) {
         this.draftsError = String(e?.message ?? e);
@@ -1225,13 +1241,17 @@ export default class PrDiff extends View {
           this.changes.terminal = term;
         }
        
-        const got = await hc(["get", term ?? "", "--json"]);
-        const pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
-        const session = pid ? JSON.parse((await readTextFile(`${home()}/.claude/sessions/${pid}.json`)) ?? "null") : null;
+        const b = await bridged(term);
+        let session = b ? { sessionId: b.sessionId, cwd: b.launchCwd ?? b.cwd } : null;
+        if (!session) {
+          const got = await hc(["get", term ?? "", "--json"]);
+          const pid = got.code === 0 ? JSON.parse(got.stdout)?.foreground?.pid : null;
+          session = pid ? JSON.parse((await readTextFile(`${home()}/.claude/sessions/${pid}.json`)) ?? "null") : null;
+        }
         if (!session?.sessionId) throw new Error("No Claude session found for this terminal.");
         this.changes.cwd = session.cwd;
         this.changes.title = panes().find((q) => q.terminal === term)?.title?.replace(/^[^\p{L}\p{N}]+\s*/u, "") ?? "Claude";
-        const file = `${home()}/.claude/projects/${session.cwd.replace(/[^A-Za-z0-9]/g, "-")}/${session.sessionId}.jsonl`;
+        const file = b?.transcript ?? `${home()}/.claude/projects/${session.cwd.replace(/[^A-Za-z0-9]/g, "-")}/${session.sessionId}.jsonl`;
         const syntax = settings().dark === false ? "OneHalfLight" : "OneHalfDark";
         const dest = `${home()}/.claude/state/changes/${term}`;
         const r = await exec("python3", ["-I", "-c", CHANGES_SCRIPT, file, session.cwd, syntax, dest]);
@@ -2281,7 +2301,7 @@ export default class PrDiff extends View {
               .on_click((_e, cx) => { cx.stop_propagation(); if (typeof done === "string") exec("open", [done]).catch(() => {}); })
               .child("Posted ↗")))
             .when(Boolean(done), (e) => e.child(smallButton(`dr-fold-${dr.n}`, "Fold", () => { this.postedOpen?.delete(dr.n); })))
-            .when(Boolean(a) && !done && !editing, (e) => e.child(smallButton(`dr-edit-${dr.n}`, "Promijeni", () => { this.cardSel = i; this.startEdit(dr.n); }))))
+            .when(Boolean(a) && !done && !editing, (e) => e.child(smallButton(`dr-edit-${dr.n}`, "Edit", () => { this.cardSel = i; this.startEdit(dr.n); }))))
           // The comment as GitHub will show it; the full path under it.
           .child(v_flex().px(16).py(12).gap(6)
             .child(div().text_size(13.5).child(this.richBody(dr.body, `dr-${dr.n}`, t, 880)))
@@ -2291,7 +2311,7 @@ export default class PrDiff extends View {
               .child(div().w(80).flex_none().text_color(t.dim).child("Why"))
               .child(div().flex_1().min_w(0).child(this.richBody(dr.why, `dr-w-${dr.n}`, t, 760)))))
             .when(Boolean(dr.ifStays), (x) => x.child(h_flex().gap(8).items_start()
-              .child(div().w(80).flex_none().text_color(t.dim).child("Ako ostane"))
+              .child(div().w(80).flex_none().text_color(t.dim).child("If it stays"))
               .child(div().flex_1().min_w(0).child(this.richBody(dr.ifStays, `dr-s-${dr.n}`, t, 760)))))))
           .when(editing, (e) => e.child(div().px(16).py(10).border_t(1).border_color(t.border)
             .child(fieldRow(this.editInput, `dr-edit-send-${dr.n}`, "Send", () => this.sendEdit())))));

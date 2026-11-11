@@ -39,12 +39,16 @@ sessions, limits, newest = [], None, 0
 for t in terms:
     s = {"terminal": t}
     try:
-        got = json.loads(subprocess.run(["hc", "get", t, "--json"], capture_output=True, text=True, timeout=5).stdout or "{}")
-        pid = (got.get("foreground") or {}).get("pid")
+        # The session-bridge mod's file names the session at once; the process walk is the fallback.
+        br = load(f"{home}/.claude/state/session/{t}.json") or {}
+        sess = {"sessionId": br["sessionId"], "cwd": br.get("launchCwd") or br.get("cwd", "")} if br.get("sessionId") else None
+        pid = None
+        if not sess:
+            got = json.loads(subprocess.run(["hc", "get", t, "--json"], capture_output=True, text=True, timeout=5).stdout or "{}")
+            pid = (got.get("foreground") or {}).get("pid")
         # While Claude runs a tool the foreground is that tool's process: walk up its parents
         # to the one Claude keeps a session file for.
-        sess = None
-        for _ in range(8):
+        for _ in range(0 if sess else 8):
             if not pid or int(pid) <= 1: break
             sess = load(f"{home}/.claude/sessions/{pid}.json")
             if sess: break

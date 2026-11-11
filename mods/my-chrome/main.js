@@ -139,10 +139,12 @@ export default class MyChrome extends View {
       .child(svg("icons/my-chrome-bell.svg").size(15))
       // Something new: a small dot, not a count.
       .when(fresh > 0, (el) => el.child(div().absolute().top(4).right(4).size(6).rounded(3).bg(t.accent ?? t.ansi4)));
+    // Making things first (a space, a machine), then finding, then what speaks to you, settings last.
     return row
-      .child(bell)
+      .child(this.button("space-new", "plus", "New space", () => run("space.new")))
+      .child(this.button("machine", "server", "Add machine", () => run("mod.open", { name: "machine-add" })))
       .child(this.button("search", "search", "Search (⌘P)", () => run("mod.open", { name: "my-picker" })))
-      .child(this.button("settings", "settings", updates().app.ready ? "Settings · update ready" : "Settings", () => run("app.settings"), Boolean(updates().app.ready)))
-      .child(this.button("machine", "server", "Add machine", () => run("mod.open", { name: "machine-add" })));
+      .child(bell)
+      .child(this.button("settings", "settings", updates().app.ready ? "Settings · update ready" : "Settings", () => run("app.settings"), Boolean(updates().app.ready)));
   }
 }

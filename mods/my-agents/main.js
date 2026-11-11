@@ -468,6 +468,8 @@ export default class Agents extends View {
     // Working wears Claude's own orange.
     if (a.status === "working") return box().text_color("#d97757")
       .child(layer("work-a").loop("top", { from: 0, to: -1.5, period: 500 }));
+    // The session in front, when not working: Claude's orange, standing still.
+    if (a.focused) return box().text_color("#d97757").child(layer("work-a"));
     if (a.status === "done") return box().text_color(t.ansi2 ?? t.done).child(layer("cheer"));
     if (a.status === "blocked") return box().text_color(t.blocked)
       .child(layer("wave"))
@@ -575,14 +577,17 @@ export default class Agents extends View {
       const review = prPaneOf(a) ? (() => {
         const num = ((a.tab_name ?? "").match(/#(\d+)/) ?? [])[1];
         const mine = Object.entries(shared("review.mine") ?? {}).find(([k]) => num && k.endsWith(`#${num}`))?.[1];
-        const n = this.drafts[a.tab] ?? 0;
+        // Drafts: the review-drafts file, else what the PR view counted from the prose.
+        const key = Object.entries(shared("pr-diff.agents") ?? {}).find(([, r]) => r?.tab === a.tab)?.[0];
+        const n = this.drafts[a.tab] || (key ? shared("review.draftCount")?.[key] ?? 0 : 0);
         const gh = { APPROVED: ["Approved", t.ansi2, "You approved"], CHANGES_REQUESTED: ["Changes", t.ansi1, "You requested changes"], COMMENTED: ["Commented", t.accent ?? t.ansi4, "You commented"] }[mine?.state];
         const look = gh ? gh.slice(0, 2)
           : a.status === "working" ? ["Reviewing", t.working]
           : a.status === "blocked" ? ["Needs you", t.blocked]
           : n > 0 ? [`${n} draft${n === 1 ? "" : "s"}`, t.done ?? t.accent]
-          : null;
-        const tip = gh ? gh[2] : a.status === "working" ? "The agent is reading the PR" : a.status === "blocked" ? "The agent is waiting for you" : n > 0 ? "Drafts are ready in the PR view" : "Not reviewed by you yet";
+          // The agent ran and stopped: its review is there, whatever it counted.
+          : ["Ready", t.done ?? t.accent];
+        const tip = gh ? gh[2] : a.status === "working" ? "The agent is reading the PR" : a.status === "blocked" ? "The agent is waiting for you" : n > 0 ? "Drafts are ready in the PR view" : "The agent is done: its review is in the PR view";
         return { look, tip, approved: mine?.state === "APPROVED" };
       })() : null;
       const isPinned = a.pinned;
@@ -666,14 +671,15 @@ export default class Agents extends View {
       return h_flex()
         .id(g.id)
         .relative()
-        .mt(14)
+        // A short label with a modest gap above it does the separating.
+        .mt(8)
         .px(8)
-        .h(24)
+        .h(22)
         .flex_none()
         .gap(6)
         .items_center()
         // A gap under it, so its hover fill and a selected row below don't touch.
-        .mb(4)
+        .mb(2)
         .rounded(6)
         .text_size(11.5)
         .cursor_pointer()
@@ -701,11 +707,11 @@ export default class Agents extends View {
         .on_mouse_down("right", () => spaceMenu(w))
         .child(h_flex().flex_1().min_w(0)
           // The name only as wide as it is: the rest of the row is for folding.
-          .child(div().id(`spn-${w.id}`).min_w(0).truncate().font_medium().text_color(w.active ? t.foreground : t.dim)
+          .child(div().id(`spn-${w.id}`).min_w(0).truncate().text_size(10.5).font_semibold().text_color(w.active ? t.foreground : t.dim)
             .hover((s) => s.text_color(t.foreground))
             .tooltip(`Go to ${w.name}`)
             .on_mouse_down("left", () => { this.nameDown = w.id; })
-            .child(w.name)))
+            .child(w.name.toUpperCase())))
         .when(!open && g.members.length > 0, (el) => el
           .when(Boolean(top) && top !== "idle", (el) => el.child(this.status(t, { status: top }, true)))
           .child(div().text_size(11).text_color(t.dim).child(String(g.members.length))))
@@ -772,34 +778,7 @@ export default class Agents extends View {
       .border_t(1)
       .border_color(t.border)
       .text_size(13)
-      .when(!collapsed, (el) =>
-        el.child(
-          h_flex()
-            .px(16)
-            .h(41)
-            .pt(14)
-            .pb(5)
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Spaces"))
-            .child(
-              div()
-                .id("space-new")
-                .size(20)
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(6)
-                .text_color(t.dim)
-                .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .tooltip("New space")
-                .on_click(() => run("space.new"))
-                .child(svg("mods/workspace-chrome/plus.svg").size(14)),
-            ),
-        ),
-      )
-      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).pb(8).overflow_y_scrollbar().mode("always")
+      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).pt(4).pb(8).overflow_y_scrollbar().mode("always")
         // A drag let go outside a header ends there.
         .on_mouse_up("left", (_e, cx) => { if (this.pressed !== null) { this.pressed = null; this.over = null; cx.notify(); } })
         .children(rows))
