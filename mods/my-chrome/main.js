@@ -76,7 +76,6 @@ export default class MyChrome extends View {
     const next = Object.fromEntries([...now].map(([k, a]) => [k, a.status]));
     this.last = next;
     if (JSON.stringify(next) !== JSON.stringify(shared("notif.lastStatus") ?? null)) setShared("notif.lastStatus", next);
-    cx.notify();
   }
 
   button(id, icon, tip, action, dot = false) {

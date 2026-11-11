@@ -7,7 +7,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, Input, InputState } from "gpui-base";
-import { panes, props, run, theme, home, hc, readTextFile, exec, terminals } from "herdr";
+import { panes, props, run, theme, home, hc, readTextFile, exec, terminals, focused } from "herdr";
 
 // A color at some opacity, whether it came as #rrggbb or already #rrggbbaa.
 const alpha = (c, a) => (c.length === 9 ? c.slice(0, 7) : c) + a;
@@ -65,6 +65,8 @@ export default class Pane extends View {
     cx.timer.every(1000, (cx) => {
       const p = this.subject();
       if (!p || p.app !== "claude-code") return;
+      // A header in a tab behind: its facts are read again when it comes to the front.
+      if (this.me() && this.me().tab !== focused()?.tab) return;
       const now = Date.now();
       const changed = p.status !== this.lastStatus;
       const due = now - (this.readAt ?? 0) > (p.status === "working" ? 4000 : 20000);

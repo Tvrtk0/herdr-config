@@ -3,6 +3,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
+const alpha = (c, a) => (c.length === 9 ? c.slice(0, 7) : c) + a;
 import { exec, theme, layout, run, spaces, agents, shared, setShared, home, panes, focused, nextCommand, readTextFile, appHome } from "herdr";
 
 // One pane of a tab at a time: zoom the next pane (the agent after the PR, the PR
@@ -80,6 +81,8 @@ export default class ReviewPrs extends View {
     this.error = null;
     this.loading = false;
     this.folded = new Set(JSON.parse(localStorage.getItem("folded") ?? "[]"));
+    // Icons live where Herdr looks for them; a new file in the linked mod is not seen until restart.
+    for (const n of ["home", "refresh"]) exec("cp", ["-n", `${appHome()}/mods/review-prs/${n}.svg`, `${appHome()}/icons/review-prs-${n}.svg`]).catch(() => {});
     cx.timer.every(EVERY, (cx) => this.refresh(cx));
     cx.spawn(async (cx) => {
       const local = await LOCAL;
@@ -93,6 +96,15 @@ export default class ReviewPrs extends View {
   refresh(cx) {
     // A search that never answers (gh hung, a reload mid-call) must not leave the spinner on
     // for good: after 40 s the next refresh starts over, and each run gives up after 30 s.
+    // The dashboard's list, when it is fresh: the same PRs, no second fetch, the same count.
+    const feed = shared("review.feed");
+    if (feed?.prs && Date.now() - feed.at < 6 * 60000) {
+      this.prs = feed.prs;
+      this.error = null;
+      setShared("review.prs", feed.prs);
+      cx.notify();
+      return;
+    }
     if (this.loading && Date.now() - (this.loadingAt ?? 0) < 40000) return;
     this.loading = true;
     this.loadingAt = Date.now();
@@ -203,7 +215,7 @@ export default class ReviewPrs extends View {
     if (this.contentH == null) return;
     const vh = globalThis.window?.viewport_size?.()?.height ?? 900;
     const cap = Math.floor((vh - 46 - 69) / 3);
-    const extra = (this.error ? 22 : 0) + (!this.error && !this.loading && this.prs.length === 0 ? 20 : 0);
+    const extra = (this.error ? 22 : 0) + (!this.error && !this.loading && (this.todoN ?? this.prs.length) === 0 ? 20 : 0);
     const want = Math.max(90, Math.min(cap, Math.ceil(41 + extra + this.contentH + 8 + 1)));
     if (Math.abs(want - (this.fitted ?? 0)) < 2) return;
     this.fitted = want;
@@ -225,14 +237,17 @@ export default class ReviewPrs extends View {
     }
     const now = Date.now();
 
+    // Only what is still to do: a PR whose review agent is open is already being handled.
+    const todo = this.prs.filter((pr) => !this.agentFor(pr));
+    this.todoN = todo.length;
     const groups = new Map();
-    for (const pr of this.prs) {
+    for (const pr of todo) {
       const repo = pr.repository.nameWithOwner;
       if (!groups.has(repo)) groups.set(repo, []);
       groups.get(repo).push(pr);
     }
     const repos = [...groups.keys()].sort((a, b) => rankRepo(a) - rankRepo(b) || a.localeCompare(b));
-    for (const list of groups.values()) list.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    for (const list of groups.values()) list.sort((a, b) => b.number - a.number);
 
     if (narrow()) {
       return v_flex()
@@ -252,16 +267,16 @@ export default class ReviewPrs extends View {
             .rounded(6)
             .cursor_pointer()
             .hover((s) => s.bg(t.hover))
-            .tooltip(`${this.prs.length} PRs waiting for your review`)
+            .tooltip(`${todo.length} PRs waiting for your review`)
             .on_click(() => run("my-agents.home:review"))
-            .child(svg("mods/workspace-chrome/git-compare.svg").size(15).text_color(this.prs.length ? t.muted : t.dim))
-            .child(div().text_size(11.5).font_semibold().text_color(this.prs.length ? t.foreground : t.dim).child(String(this.prs.length))),
+            .child(svg("mods/workspace-chrome/git-compare.svg").size(15).text_color(todo.length ? t.muted : t.dim))
+            .child(div().text_size(11.5).font_semibold().text_color(todo.length ? t.foreground : t.dim).child(String(todo.length))),
         );
     }
 
-    const header = (repo) => {
-      const open = !this.folded.has(repo);
-      return h_flex()
+    // A repo: its name and how many wait; the full list is the dashboard's.
+    const header = (repo) =>
+      h_flex()
         .id(`rp-g-${repo}`)
         .px(8)
         .pt(8)
@@ -274,12 +289,11 @@ export default class ReviewPrs extends View {
         .text_color(t.dim)
         .cursor_pointer()
         .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, cx) => this.toggle(repo, cx))
+        .tooltip("All of them on the Review Dashboard")
+        .on_click(() => this.home())
         .child(div().truncate().child(repo.split("/")[1]))
-        .child(div().child(String(groups.get(repo).length)))
         .child(div().flex_1())
-        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none());
-    };
+        .child(div().px(6).rounded(8).bg(t.raised).text_color(t.foreground).child(String(groups.get(repo).length)));
 
     const row = (pr) =>
       v_flex()
@@ -331,19 +345,67 @@ export default class ReviewPrs extends View {
             .child(`${pr.author?.is_bot ? "bot" : pr.author?.login ?? "?"} · ${age(pr.updatedAt, now)}`),
         );
 
-    const rows = repos.flatMap((repo) => [header(repo), ...(this.folded.has(repo) ? [] : groups.get(repo).map(row))]);
+    // The newest a person opened; a bot's bump only when nothing else waits (it still counts).
+    const bot = (pr) => pr.author?.is_bot || /\[bot\]$|^(dependabot|renovate|app\/)/.test(pr.author?.login ?? "");
+    const lead = (list) => list.find((pr) => !bot(pr)) ?? list[0];
+    // One card a repo: name and count on top, its newest PR on a single line under it.
+    const short = (title) => title.replace(/^(\s*\[[^\]]*\]\s*)+/, "");
+    const card = (repo) => {
+      const list = groups.get(repo);
+      const pr = lead(list);
+      return v_flex()
+        .id(`rp-c-${repo}`)
+        .flex_none()
+        .cursor_pointer()
+        .hover((s) => s.border_color(t.muted))
+        .tooltip(`${pr.title}\n${pr.author?.login ?? "?"} · ${age(pr.updatedAt, now)}`)
+        .on_click(() => this.diff(pr))
+        .px(10)
+        .py(7)
+        .gap(3)
+        .rounded(8)
+        .bg(t.hover)
+        .border(1)
+        .border_color(t.border)
+        .child(
+          h_flex()
+            .id(`rp-g-${repo}`)
+            .gap(6)
+            .items_center()
+            .text_size(11)
+            .text_color(t.dim)
+            .child(div().flex_1().min_w(0).truncate().font_medium().child(repo.split("/")[1]))
+            .child(div().font_semibold().text_color(t.foreground).child(String(list.length)))
+            .child(div().text_color(t.dim).child(list.length === 1 ? "PR" : "PRs")),
+        )
+        .child(
+          h_flex()
+            .id(`rp-${pr.url}`)
+            .gap(6)
+            .items_center()
+            .text_size(12)
+            .text_color(t.foreground)
+            .child(div().flex_none().text_color(t.dim).child(`#${pr.number}`))
+            .child(div().flex_1().min_w(0).truncate().child(short(pr.title)))
+            .child(div().flex_none().text_size(10.5).text_color(t.dim).child(age(pr.updatedAt, now))),
+        );
+    };
+    const rows = repos.map(card);
 
     const refresh = this.loading
-      ? svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.dim).spin(900)
+      ? svg("mods/workspace-chrome/spinner.svg").size(15).flex_none().text_color(t.dim).spin(900)
       : div()
           .id("rp-refresh")
           .text_size(13)
           .text_color(t.dim)
           .cursor_pointer()
           .hover((s) => s.text_color(t.foreground))
+          .p(3)
+          .rounded(5)
+          .hover((s) => s.bg(t.hover))
           .tooltip("Refresh")
           .on_click((_e, cx) => this.refresh(cx))
-          .child("↻");
+          .child(svg("icons/review-prs-refresh.svg").size(15));
 
     return v_flex()
       .size_full()
@@ -366,11 +428,11 @@ export default class ReviewPrs extends View {
               .gap(6)
               .items_center()
               .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Review"))
-              .when(this.prs.length > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(this.prs.length)))),
+              .when(todo.length > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(todo.length)))),
           )
           .child(
             h_flex()
-              .gap(10)
+              .gap(4)
               .items_center()
               .child(
                 div()
@@ -379,9 +441,12 @@ export default class ReviewPrs extends View {
                   .text_color(t.dim)
                   .cursor_pointer()
                   .hover((s) => s.text_color(t.foreground))
-                  .tooltip("Review Dashboard")
+                  .p(3)
+                  .rounded(5)
+                  .hover((s) => s.bg(t.hover))
+                  .tooltip("Review Dashboard (⌘⇧O)")
                   .on_click(() => this.home())
-                  .child("⌂"),
+                  .child(svg("icons/review-prs-home.svg").size(15)),
               )
               .child(refresh),
           ),
@@ -389,12 +454,12 @@ export default class ReviewPrs extends View {
       .when(Boolean(this.error), (el) =>
         el.child(div().px(16).pb(6).text_size(11.5).text_color(t.blocked).child(this.error)),
       )
-      .when(!this.error && !this.loading && this.prs.length === 0, (el) =>
+      .when(!this.error && !this.loading && todo.length === 0, (el) =>
         el.child(div().px(16).text_size(12).text_color(t.dim).child("Nothing waiting for your review.")),
       )
       .child(v_flex().id("rp-list").flex_1().min_h(0).px(8).pb(8).overflow_y_scrollbar()
         // The rows at their own height: the block is sized from it (see fit).
-        .child(v_flex().id("rp-content").flex_none().w_full()
+        .child(v_flex().id("rp-content").flex_none().w_full().gap(6).pt(2)
           .on_size_change((size) => { this.contentH = size.height; this.fit(); })
           .children(rows)));
   }

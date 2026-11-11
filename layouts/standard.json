@@ -26,17 +26,6 @@
           "type": "column",
           "children": [
             {
-              "id": "spaces",
-              "type": "block",
-              "content": {
-                "mod": "my-spaces"
-              },
-              "size": {
-                "weight": 1
-              },
-              "min": 90
-            },
-            {
               "id": "agents",
               "type": "block",
               "content": {

@@ -158,6 +158,13 @@ export default class ReviewDashboard extends View {
         });
         this.data = data;
         this.at = Date.now();
+        // One fetch for everyone: the sidebar and the picker read this instead of asking GitHub.
+        const only = new Set(SECTIONS.filter((x) => x.id.startsWith("only:")).map((x) => x.id.slice(5)));
+        const waiting = [
+          ...(data.waiting ?? []).filter((p) => !only.has(p.repo)),
+          ...SECTIONS.filter((x) => x.id.startsWith("only:")).flatMap((x) => data[x.id] ?? []),
+        ].filter((p) => !p.draft);
+        setShared("review.feed", { at: Date.now(), prs: waiting.map((p) => ({ number: p.number, title: p.title, url: p.url, updatedAt: p.updated, repository: { nameWithOwner: p.repo }, author: { login: p.author } })) });
         // Stacks: every open PR of these repos, head and base branches, one cheap list per repo.
         const repos = [...new Set(Object.values(data).flat().map((p) => p.repo))];
         const lists = await Promise.all(repos.map((r) => exec("gh", ["pr", "list", "--repo", r, "--state", "open", "--limit", "200", "--json", "number,headRefName,baseRefName,title"])));

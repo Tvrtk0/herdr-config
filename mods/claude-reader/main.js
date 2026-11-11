@@ -497,10 +497,15 @@ export default class ClaudeReader extends View {
       }
     });
     // The file changes as Claude writes: a cheap look every second and a half.
-    cx.timer.every(1500, (cx) => this.poll(cx));
-    cx.timer.every(1000, (cx) => { if (this.pane()?.status === "working") cx.notify(); });
+    // Only while in view (Herdr keeps hidden copies running); coming into view looks at once.
+    cx.timer.every(1500, (cx) => {
+      const seen = this.inView();
+      if (seen) this.poll(cx);
+      this.wasInView = seen;
+    });
+    cx.timer.every(1000, (cx) => { if (this.inView() && this.pane()?.status === "working") cx.notify(); });
     // The session can change (/clear, a resume): find it again now and then.
-    cx.timer.every(30000, (cx) => { this.file = null; this.poll(cx); });
+    cx.timer.every(30000, (cx) => { if (!this.inView()) return; this.file = null; this.poll(cx); });
     this.poll(cx);
     // Pictures copied out of transcripts: anything untouched for three days goes; a picture
     // still in view is written again on the next read.
@@ -510,6 +515,14 @@ export default class ClaudeReader extends View {
     // to ~/.claude/state/notes/<session id>.md (read again when the session changes).
     this.nv = vimNew("");
     this.nvHandle = cx.focus_handle();
+  }
+
+  // In view: an overlay, or a pane in the tab in front. Herdr keeps hidden copies running, so
+  // their timers ask this before doing any work.
+  inView() {
+    if (props()?.overlay) return true;
+    const me = panes().find((p) => p.pane === props()?.pane);
+    return !me || me.tab === focused()?.tab;
   }
 
   // A changed file's diff, from git in the file's folder (an untracked file against nothing).

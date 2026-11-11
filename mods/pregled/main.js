@@ -51,9 +51,15 @@ export default class Overview extends View {
     if (props()?.overlay) { this.handle.focus(); cx.timer.after(150, () => this.handle.focus()); }
     this.load(cx);
     this.loadCal(cx);
-    cx.timer.every(30000, (cx) => this.load(cx));
+    cx.timer.every(30000, (cx) => { if (this.visible()) this.load(cx); });
     cx.timer.every(300000, (cx) => this.loadCal(cx));
-    cx.timer.every(1000, (cx) => cx.notify());
+    // The ages tick, and a board that comes to the front reads its sessions at once.
+    cx.timer.every(1000, (cx) => {
+      const seen = this.visible();
+      if (seen && !this.wasVisible) this.load(cx);
+      this.wasVisible = seen;
+      if (seen) cx.notify();
+    });
     // The board breathes and bounces: a quicker redraw while a session works or needs you.
     cx.timer.every(120, (cx) => { if (this.visible() && agents().some((a) => a.app === "claude-code" && (a.status === "working" || a.status === "blocked"))) cx.notify(); });
   }

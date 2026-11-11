@@ -745,12 +745,23 @@ export default class PrDiff extends View {
     });
     this.load(cx);
     this.loadDrafts(cx);
+    this.loadPosted();
+    // A refresh asked for from outside a render (after posting): picked up within a second.
+    cx.timer.every(1000, (cx) => { if (this.metaWanted) { this.metaWanted = 0; this.refreshMeta(cx); } });
     ME.then((me) => { this.me = me; this.publishMine(); cx.notify(); });
     // While a review runs or its comments are shown, GitHub's side is looked at again now and
     // then, so a posted comment or review shows as such.
-    cx.timer.every(30000, (cx) => { if (!this.changes && (this.reviewAgent() || this.tab === "agent")) this.refreshMeta(cx); });
+    cx.timer.every(30000, (cx) => { if (this.inView() && !this.changes && (this.reviewAgent() || this.tab === "agent")) this.refreshMeta(cx); });
     // While an agent is on this PR its drafts can change; a cheap re-read when its file did.
-    cx.timer.every(4000, (cx) => { if (this.reviewAgent() || this.tab === "agent") this.loadDrafts(cx); });
+    cx.timer.every(4000, (cx) => { if (this.inView() && (this.reviewAgent() || this.tab === "agent")) this.loadDrafts(cx); });
+  }
+
+  // In view: an overlay, or a pane in the tab in front. Herdr keeps hidden copies running, so
+  // their timers ask this before doing any work.
+  inView() {
+    if (props()?.overlay) return true;
+    const me = panes().find((p) => p.pane === props()?.pane);
+    return !me || me.tab === focused()?.tab;
   }
 
   loadDrafts(cx) {
@@ -762,10 +773,25 @@ export default class PrDiff extends View {
       try {
         const r = await exec("python3", ["-I", "-c", TRANSCRIPT, folder, this.url, this.draftsFile ?? ""]);
         const got = r.code === 0 ? JSON.parse(r.stdout || "{}") : {};
-        if (got.file && (got.file !== this.draftsFile || got.mtime !== this.draftsMtime)) {
+        // The drafts as data, when the review skill handed them over (review-drafts mod).
+        const [o, n] = this.repo.split("/");
+        const raw = await readTextFile(`${home()}/.claude/state/review/${o}-${n}-${this.number}.json`).catch(() => null);
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch {}
+        const dataAt = data?.at ?? 0;
+        if (got.file && (got.file !== this.draftsFile || got.mtime !== this.draftsMtime || dataAt !== this.draftsDataAt)) {
           this.draftsFile = got.file;
           this.draftsMtime = got.mtime;
+          this.draftsDataAt = dataAt;
           this.drafts = parseDrafts(got.texts ?? []);
+          if (data?.drafts?.length) {
+            this.drafts.list = data.drafts.map((d) => ({
+              n: d.n, count: String(d.body ?? "").replace(/\n/g, "").length, path: d.path || null, line: d.line ?? null,
+              startLine: d.start_line ?? null, side: d.side ?? "RIGHT", note: d.note ?? "", body: d.body ?? "",
+              why: d.why ?? null, ifStays: d.if_stays ?? null, structured: true,
+            })).sort((a, b) => a.n - b.n);
+            if (data.dropped) this.drafts.dropped = data.dropped;
+          }
           // The conversation since the drafts: what was asked, what Claude answered.
           const last = this.drafts.lastBlocks;
           this.drafts.talk = (got.turns ?? []).filter((x) => (x.role === "user" ? x.at > last : x.at > last)).slice(-12);
@@ -781,6 +807,8 @@ export default class PrDiff extends View {
 
   // A draft already on the PR: an inline thread or a conversation comment with its text.
   posted(d) {
+    const rec = this.postedIds?.[d.n];
+    if (rec && squash(rec.body) === squash(d.body)) return rec.url ?? true;
     const want = squash(d.body);
     if (!want) return null;
     for (const th of this.threads ?? []) for (const c of th.comments) if (squash(c.body) === want) return c.url ?? true;
@@ -811,7 +839,7 @@ export default class PrDiff extends View {
     const mode = this.reviewMode;
     const body = this.bodyInput.value();
     const message = this.postMessage(nums, mode, body);
-    if (!a || !message) return;
+    if (!message) return;
     setShared(POST_KEY, { repo: this.repo, number: this.number, nums, mode, body, at: Date.now() });
     const what = { comment: "Post the comments on", approve: nums.length ? "Post the comments and approve" : "Approve", changes: nums.length ? "Post the comments and request changes on" : "Request changes on" }[mode];
     openOverlay({
@@ -821,23 +849,73 @@ export default class PrDiff extends View {
       height: 230,
       props: {
         title: `${what} PR #${this.number}?`,
-        detail: `Sent to Claude:\n"${message}"\n\nPosts under your name. A post can only be taken back by deleting it on GitHub.`,
+        detail: `${nums.length ? `Comments ${nums.join(", ")} go on the PR as they are written` : "No comments"}${mode === "comment" ? "" : `, then the review (${mode === "approve" ? "approve" : "request changes"}${body.trim() ? ", with your text" : ""})`}.\n\nPosts under your name. A post can only be taken back by deleting it on GitHub.`,
         command: { name: "pr-diff.post" },
       },
     });
   }
 
+  // Posts the ticked drafts and the review straight to GitHub (no agent in between): each
+  // file comment on its line, a PR-level one in the conversation, then the review itself.
+  // What went up is kept by number with its id and link, so Posted is exact.
   postChosen() {
     const req = shared(POST_KEY);
     if (!req || req.repo !== this.repo || req.number !== this.number || Date.now() - req.at > 120000) return;
     setShared(POST_KEY, null);
-    const message = this.postMessage(req.nums, req.mode ?? "comment", req.body ?? "");
-    if (!message) return;
-    this.sendToAgent(message, () => {
-      this.chosen.clear(); this.bodyInput.set_value("");
-      // The agent posts in its own time; the 30-second look at GitHub (while it runs) shows it.
-    });
+    const list = (this.drafts?.list ?? []).filter((d) => req.nums.includes(d.n) && !this.posted(d));
+    const sha = this.info?.headRefOid;
+    const base = `repos/${this.repo}`;
+    const parse = (r) => { try { return JSON.parse(r.stdout || "{}"); } catch { return {}; } };
+    (async () => {
+      this.posting = true; this.sendError = null; this.redraw();
+      const ids = { ...(this.postedIds ?? {}) };
+      try {
+        for (const d of list) {
+          let r;
+          if (d.path && d.line && sha) {
+            const args = ["api", "--method", "POST", `${base}/pulls/${this.number}/comments`, "-f", `body=${d.body}`, "-f", `commit_id=${sha}`, "-f", `path=${d.path}`, "-F", `line=${d.line}`, "-f", `side=${d.side ?? "RIGHT"}`];
+            if (d.startLine && d.startLine < d.line) args.push("-F", `start_line=${d.startLine}`, "-f", `start_side=${d.side ?? "RIGHT"}`);
+            r = await exec("gh", args);
+          } else {
+            r = await exec("gh", ["api", "--method", "POST", `${base}/issues/${this.number}/comments`, "-f", `body=${d.body}`]);
+          }
+          const got = parse(r);
+          if (r.code !== 0 || !got.id) throw new Error(`#${d.n}: ${got.message ?? (r.stderr || "failed").trim().split("\n").pop()}`);
+          ids[d.n] = { id: got.id, url: got.html_url, body: d.body };
+          this.postedIds = { ...ids };
+          this.savePosted();
+        }
+        if (req.mode === "approve" || req.mode === "changes") {
+          const args = ["api", "--method", "POST", `${base}/pulls/${this.number}/reviews`, "-f", `event=${req.mode === "approve" ? "APPROVE" : "REQUEST_CHANGES"}`];
+          if ((req.body ?? "").trim()) args.push("-f", `body=${req.body.trim()}`);
+          if (sha) args.push("-f", `commit_id=${sha}`);
+          const r = await exec("gh", args);
+          const got = parse(r);
+          if (r.code !== 0 || !got.id) throw new Error(`review: ${got.message ?? (r.stderr || "failed").trim().split("\n").pop()}`);
+        }
+        this.chosen.clear(); this.bodyInput.set_value("");
+      } catch (e) {
+        this.sendError = String(e?.message ?? e);
+      }
+      this.posting = false;
+      this.refreshMetaNow();
+    })();
   }
+
+  // The ids of what this PR view posted, kept beside the drafts.
+  postedPath() {
+    const [o, n] = this.repo.split("/");
+    return `${home()}/.claude/state/review/${o}-${n}-${this.number}.posted.json`;
+  }
+  savePosted() {
+    exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && printf %s "$2" > "$1"', "sh", this.postedPath(), JSON.stringify(this.postedIds ?? {})]).catch(() => {});
+  }
+  loadPosted() {
+    if (this.changes || !this.repo) return;
+    readTextFile(this.postedPath()).then((t) => { try { this.postedIds = JSON.parse(t ?? "{}") ?? {}; } catch { this.postedIds = {}; } this.redraw(); }).catch(() => {});
+  }
+  // GitHub's side again right away, from outside a render.
+  refreshMetaNow() { this.metaWanted = Date.now(); this.redraw(); }
 
   // Types into the review agent's pane and presses enter, as if typed there.
   sendToAgent(text, done) {
@@ -2221,7 +2299,7 @@ export default class PrDiff extends View {
     const nums = [...this.chosen].sort((x, y) => x - y);
     const mode = this.reviewMode;
     const body = this.bodyInput.value();
-    const ready = Boolean(a) && Boolean(this.postMessage(nums, mode, body));
+    const ready = !this.posting && Boolean(this.postMessage(nums, mode, body));
     const modes = [["comment", "Samo komentar", "c"], ["approve", "Approve", "a"], ["changes", "Request changes", "x"]];
     const modeColor = { comment: t.accent, approve: t.ansi2, changes: t.ansi1 };
     const postLabel = { comment: "Post comments…", approve: nums.length ? "Post and approve…" : "Approve…", changes: nums.length ? "Post and request changes…" : "Request changes…" }[mode];
@@ -2243,13 +2321,13 @@ export default class PrDiff extends View {
         .child(div().id("dr-post").flex_none().px(12).h(28).flex().items_center().rounded(6).text_size(12.5)
           .when(ready, (e) => e.bg(modeColor[mode]).text_color(ink).font_semibold().cursor_pointer().hover((s) => s.opacity(0.9)).on_click(() => this.askPost()))
           .when(!ready, (e) => e.border_1().border_color(t.border).text_color(t.dim)
-            .tooltip(!a ? "The agent for this PR is no longer open" : mode === "changes" ? "Write the review text" : "Tick some comments first"))
+            .tooltip(this.posting ? "Posting…" : mode === "changes" ? "Write the review text" : "Tick some comments first"))
           .child(h_flex().gap(8).items_center().child(div().child(postLabel))
             .child(div().px(4).rounded(3).text_size(10.5).when(ready, (x) => x.bg(alpha(ink, "26"))).when(!ready, (x) => x.text_color(t.dim)).child("enter")))))
       .when(mode !== "comment", (e) => e.child(div().id("dr-body-field").w_full().h(32).px(10).flex().items_center().rounded(8).border_1().border_color(t.input)
         .on_mouse_down("left", (_e, cx) => { this.bodyInput.focus(); this.typing = true; cx.notify(); })
         .child(Input.new(this.bodyInput).flex_1().text_size(12.5).text_color(t.foreground))))
-      .when(Boolean(this.sendError), (e) => e.child(div().px(10).py(6).rounded(6).bg(alpha(t.blocked, "1f")).text_color(t.blocked).child(`Slanje agentu nije uspjelo: ${this.sendError}`)))
+      .when(Boolean(this.sendError), (e) => e.child(div().px(10).py(6).rounded(6).bg(alpha(t.blocked, "1f")).text_color(t.blocked).child(`Posting stopped: ${this.sendError}`)))
       .child(h_flex().gap(14).text_size(11).text_color(t.dim)
         .children([["j/k", "comment"], ["space", "tick"], ["T", "all"], ["c/a/x  m", "mode"], ["b", "review text"], ["enter", "post"], ["e", "edit"], ["i", "ask"]]
           .map(([k, what]) => h_flex().gap(5).items_center().child(div().px(4).rounded(3).bg(t.raised).text_color(t.muted).child(k)).child(div().child(what)))));
@@ -2282,6 +2360,16 @@ export default class PrDiff extends View {
         .child(div().text_size(13).font_semibold().text_color(color).child(`Review submitted · ${label}`))
         .child(div().text_size(12).text_color(t.muted).child(`all ${list.length} comment${list.length > 1 ? "s" : ""} on GitHub`))
         .child(div().flex_1())
+        // The review is in: its agent has done its job. Two clicks end it (its pane closes).
+        .when(Boolean(this.reviewAgent()), (e) => {
+          const ag = this.reviewAgent();
+          const sure = this.closeAsked && Date.now() - this.closeAsked < 4000;
+          return e.child(smallButton("dr-close", sure ? "Click again to end it" : "Close agent", () => {
+            if (!sure) { this.closeAsked = Date.now(); return; }
+            this.closeAsked = 0;
+            run("terminal.kill", { terminal: ag.address });
+          }));
+        })
         .child(smallButton("dr-gh", "Open on GitHub", () => exec("open", [this.url ?? `https://github.com/${this.repo}/pull/${this.number}`]).catch(() => {})));
     })();
     const main = v_flex().flex_1().min_w(0).h_full().min_h(0)
