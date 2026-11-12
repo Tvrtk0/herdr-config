@@ -44,6 +44,7 @@ const CONTEXT = {
   stats: ["Stats", [["R", "Refresh"], ["[ / ]", "Other dashboards"]]],
   news: ["News", [["R", "Refresh"], ["R R", "Write a new What's new now"], ["Click", "Open in the browser"], ["[ / ]", "Other dashboards"]]],
   review: ["Review", [["h / l, 1-3", "Ready / drafts / mine"], ["j / k", "Pick a PR"], ["enter", "Open it"], ["r", "Review in the background"], ["o", "On GitHub"], ["D", "Drafts on / off"], ["gg / G", "First / last"], ["zz", "Center"], ["R", "Refresh"], ["[ / ]", "Other dashboards"]]],
+  tasks: ["Tasks", [["j / k", "Pick a task"], ["enter, o", "Open in YouTrack"], ["s", "Start in Claude"], ["m, then 1-9", "Change its state"], ["p", "Its PR"], ["w", "Its worktree as a space"], ["gg / G", "First / last"], ["R", "Refresh"], ["[ / ]", "Other dashboards"]]],
   worktrees: ["Worktrees", [["h / l, 1-3", "Repo"], ["j / k", "Pick a worktree"], ["enter", "Open as a space"], ["o", "Its PR"], ["x", "Remove (asks first)"], ["gg / G", "First / last"], ["R", "Refresh"], ["[ / ]", "Other dashboards"]]],
 };
 const pretty = (k) => k.replace(/cmd-/g, "⌘").replace(/shift-/g, "⇧").replace(/alt-/g, "⌥").replace(/ctrl-/g, "⌃").replace(/enter/g, "↵");

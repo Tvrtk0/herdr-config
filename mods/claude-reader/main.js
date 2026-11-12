@@ -8,7 +8,7 @@
 // focused Claude session alone, Esc closes it.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, TextView } from "gpui-base";
+import { v_flex, h_flex, TextView, Editor, EditorState } from "gpui-base";
 import { exec, hc, home, appHome, props, theme, panes, readTextFile, nextCommand, settings, run, shared, setShared, focused, agents, closeOverlay, openOverlay, layout } from "herdr";
 
 // Text faces reading mode can wear, all shipped with macOS: Herdr's own, two modern serifs
@@ -197,6 +197,14 @@ print(json.dumps({"entries": out[-400:], "partial": size > want, "size": size, "
 `;
 
 // Prose and fenced code apart, so each code block can carry a copy button.
+// A fence's language as Herdr's code view names it (as the files mod maps extensions).
+const CODE_LANG = { ts: "js", tsx: "js", jsx: "js", mjs: "js", cjs: "js", mts: "js", typescript: "js", javascript: "js",
+  yml: "yaml", toml: "yaml", jsonc: "json", json5: "json", sh: "bash", shell: "bash", zsh: "bash", console: "bash",
+  py: "python", rb: "ruby", rs: "rust", md: "markdown", svelte: "html", vue: "html", liquid: "html", htm: "html" };
+// Code views: line height and padding, the same for the view and the box standing in for it,
+// so nothing moves when one replaces the other.
+const CODE_LINE = 20, CODE_PAD = 10;
+
 function pieces(text) {
   const out = [];
   // A fence may be indented (code inside a list item): the same indent comes off its lines.
@@ -207,7 +215,8 @@ function pieces(text) {
     const pad = m[1].length;
     const body = m[0].replace(/^[^\n]*\n/, "").replace(/\n[^\n]*$/, "")
       .split("\n").map((l) => l.slice(Math.min(pad, l.length - l.trimStart().length))).join("\n");
-    out.push({ code: true, text: m[0], body });
+    const lang = (/^[ \t]*(?:\x60{3,}|~{3,})[ \t]*([\w+#.-]*)/.exec(m[0]) ?? [])[1]?.toLowerCase() ?? "";
+    out.push({ code: true, text: m[0], body, lang });
     last = m.index + m[0].length;
   }
   if (last < text.length) out.push({ code: false, text: text.slice(last) });
@@ -514,6 +523,8 @@ export default class ClaudeReader extends View {
     });
     // The file changes as Claude writes: a cheap look every second and a half.
     // Only while in view (Herdr keeps hidden copies running); coming into view looks at once.
+    // Code views asked for while drawing are made here, outside the draw.
+    cx.timer.every(150, (cx) => { if (this.codeWanted?.size) this.makeCodeViews(cx); });
     cx.timer.every(1500, (cx) => {
       const seen = this.inView();
       if (seen) this.poll(cx);
@@ -700,12 +711,66 @@ export default class ClaudeReader extends View {
   }
 
   you(x, t) {
-    const text = (x.text ?? "").replace(/\[Image #\d+\]\s*/g, "").trim();
+    const full = (x.text ?? "").replace(/\[Image #\d+\]\s*/g, "").trim();
+    // A very long prompt (a compaction's summary, a big paste) starts folded: one box thousands
+    // of pixels tall made the chat jump while scrolling past it.
+    const long = full.length > 2500 && !(this.unfolded ??= new Set()).has(x.id);
+    const text = long ? `${full.slice(0, 600).trimEnd()}…` : full;
     return h_flex().w_full().justify_end().child(
       v_flex().max_w(620).gap(8).px(14).py(10).rounded(14).bg(alpha(t.accent, "24")).border_1().border_color(alpha(t.accent, "40"))
         .text_size(props()?.overlay ? 15 : 13.5).when(Boolean(props()?.overlay), (e) => e.line_height(1.55)).text_color(t.foreground)
         .when((x.images ?? []).length > 0, (e) => e.child(h_flex().gap(8).flex_wrap().children(x.images.map((p) => this.picture(p, 280, t)))))
-        .when(Boolean(text), (e) => e.child(TextView.markdown(`rd-you-${x.id}`, text).selectable(true))));
+        .when(Boolean(text), (e) => e.child(TextView.markdown(`rd-you-${x.id}`, text).selectable(true)))
+        .when(long, (e) => e.child(div().id(`rd-unfold-${x.id}`).text_size(12).text_color(t.muted).cursor_pointer()
+          .hover((s) => s.text_color(t.foreground))
+          .on_click((_e, cx) => { this.unfolded.add(x.id); delete this.heights[x.id]; cx.notify(); })
+          .child(`Show all · ${Math.round(full.length / 1000)}k characters`))));
+  }
+
+  // A fenced block as a code view. Its state cannot be made while drawing, so the first frame
+  // shows an empty box of the same size and asks for it; a timer makes it. Only blocks being
+  // drawn (near the screen) ask, a few at a time, and one drawn in the last seconds is kept.
+  codeView(key, p, t) {
+    this.codeViews ??= new Map();
+    const id = `${key}:${p.body.length}`;
+    const lines = p.body.split("\n").length;
+    const box = div().w_full().relative().rounded(6).border_1().border_color(t.border).bg(t.raised).px(12).py(CODE_PAD)
+      .h(lines * CODE_LINE + CODE_PAD * 2 + 2);
+    const got = this.codeViews.get(id);
+    if (!got) {
+      (this.codeWanted ??= new Map()).set(id, { lang: CODE_LANG[p.lang] ?? p.lang, body: p.body });
+      return box;
+    }
+    got.used = Date.now();
+    return box
+      .child(div().w_full().h(lines * CODE_LINE).child(Editor.new(got.state)))
+      // The view scrolls itself under the wheel: a cover hands the wheel to the chat.
+      .child(div().id(`rd-cv-${key}`).absolute().left(0).top(0).right(0).bottom(0).on_scroll_wheel((e, cx) => {
+        this.stopGlide(); this.scrollBy(-(e.delta?.y ?? 0)); cx.stop_propagation();
+        if (!this.wheelQueued) { this.wheelQueued = true; cx.timer.after(0, (cx) => { this.wheelQueued = false; cx.notify(); }); }
+      }));
+  }
+
+  makeCodeViews(cx) {
+    const t = theme();
+    let made = 0;
+    for (const [id, w] of this.codeWanted ?? []) {
+      if (made >= 6) break;
+      this.codeWanted.delete(id);
+      if (this.codeViews.has(id)) continue;
+      this.codeViews.set(id, { used: Date.now(), state: EditorState.new({
+        language: w.lang, value: w.body, readonly: true, line_numbers: false, folding: false, soft_wrap: false,
+        font_family: settings().font_family, font_size: 13,
+        syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6, boolean: t.ansi1 },
+      }) });
+      made++;
+    }
+    // Past 80, the ones not drawn for ten seconds go (never one on screen).
+    if (this.codeViews.size > 80) {
+      const now = Date.now();
+      for (const [id, v] of this.codeViews) if (now - v.used > 10000) { v.state.release?.(); this.codeViews.delete(id); }
+    }
+    if (made) cx.notify();
   }
 
   copy(text, key, cx) {
@@ -726,6 +791,10 @@ export default class ClaudeReader extends View {
       .children(parts.map((p, i) => {
         const key = `${x.id}-${i}`;
         if (!p.code && !p.quote) return div().w_full().when(page && Boolean(p.head) && i > 0, (e) => e.pt(12)).child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true)));
+        // A fence that names its language, in reading mode: Herdr's code view, coloured.
+        if (page && p.code && p.lang) return div().w_full().relative()
+          .child(this.codeView(key, p, t))
+          .child(this.copyButton(`rd-copy-${key}`, p.body, key, t, true));
         return div().w_full().relative()
           // A quote keeps clear of the button on its right.
           .child(div().w_full().when(Boolean(p.quote), (q) => q.pr(70)).child(link(TextView.markdown(`rd-${key}`, p.text).selectable(true))))
@@ -1518,6 +1587,16 @@ export default class ClaudeReader extends View {
     const thumb = st.full > st.view + 1 && st.view > 0;
     const thumbH = thumb ? Math.max(28, (st.view * st.view) / st.full) : 0;
     const thumbTop = thumb ? ((st.view - thumbH) * st.off) / (st.full - st.view) : 0;
+    // The empty column on the right (centres the chat in reading mode): it scrolls the chat
+    // too and holds the scrollbar, at the window's edge. Its width comes from the row's, which
+    // nothing inside the row changes.
+    const sideW = (props()?.overlay && this.entries.some((x) => x.k === "you")) ? Math.max(0, Math.min(250, (this.readW ?? 0) - 250 - 796)) : 0;
+    const wheel = (e, cx) => {
+      this.stopGlide(); this.scrollBy(-(e.delta?.y ?? 0)); cx.stop_propagation();
+      // Many wheel events land in one frame: one redraw for all of them.
+      if (!this.wheelQueued) { this.wheelQueued = true; cx.timer.after(0, (cx) => { this.wheelQueued = false; cx.notify(); }); }
+    };
+    const bar = (e) => e.child(div().absolute().right(3).top(thumbTop).w(4).h(thumbH).rounded(2).bg(t.border));
 
     const part = props()?.overlay ? "reading" : props()?.part ?? "both";
     if (part === "side") {
@@ -1545,7 +1624,7 @@ export default class ClaudeReader extends View {
         .child(div().id("rd-content").absolute().left(0).w_full().top(-st.off)
           .on_size_change((size, cx) => { if (Math.abs(size.height - st.full) >= 1) { st.full = size.height; cx.notify(); } })
           .child(body))
-        .when(thumb, (e) => e.child(div().absolute().right(3).top(thumbTop).w(4).h(thumbH).rounded(2).bg(t.border)))
+        .when(thumb && sideW === 0, bar)
         .when(!this.follow, (e) => e.child(div().id("rd-end").absolute().bottom(12).right(18).px(10).h(26).flex().items_center().rounded(13)
           .bg(t.popover).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer()
           .hover((s) => s.text_color(t.foreground))
@@ -1554,7 +1633,7 @@ export default class ClaudeReader extends View {
       // As wide as the prompt list on the left, room allowing: the chat sits in the window's
       // middle, not the middle of what the list leaves.
       .when(part === "reading" && this.entries.some((x) => x.k === "you"), (e) =>
-        e.child(div().flex_none().w(Math.max(0, Math.min(250, (this.readW ?? 0) - 250 - 796)))))
+        e.child(div().id("rd-side").flex_none().h_full().relative().w(sideW).on_scroll_wheel(wheel).when(thumb && sideW > 0, bar)))
       .when(part !== "chat" && part !== "reading", (e) => e.child(this.side(t, status))))
       .when(true, (e) => e.child(h_flex().flex_none().when(!keysHere, (x) => x.opacity(0.45)).px(14).h(24).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().text_color(t.muted).child(title))

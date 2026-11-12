@@ -34,7 +34,7 @@ const alpha = (c, a) => ((c ?? "").length === 9 ? c.slice(0, 7) : c ?? "#888888"
 // The Home space: the three dashboards as tabs, always loaded (Overview, Review, Worktrees).
 // "my-agents.home" goes there (to the tab you left it on), "home:<id>" to one dashboard,
 // "home:next" / "home:prev" step through them. A missing space or tab is made again.
-const HOME = [["agents", "Agents", "pregled"], ["review", "Review", "review-dashboard"], ["worktrees", "Worktrees", "my-worktrees"], ["stats", "Stats", "stats"], ["news", "News", "news"]];
+const HOME = [["agents", "Agents", "pregled"], ["review", "Review", "review-dashboard"], ["tasks", "Tasks", "tasks"], ["worktrees", "Worktrees", "my-worktrees"], ["stats", "Stats", "stats"], ["news", "News", "news"]];
 function homeSpace() {
   return spaces().find((s) => s.name.toLowerCase() === "home") ?? null;
 }

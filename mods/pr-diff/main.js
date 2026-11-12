@@ -1419,6 +1419,7 @@ export default class PrDiff extends View {
         const colored = cut < 0 ? [] : diff.stdout.slice(cut + 1).split("\n");
         this.files = parse(plain, colored);
         for (const f of this.files) f.hash = hashOf(f.lines);
+        this.loadTree();
         this.checks = checksOf(this.info);
         const keep = this.files.find((f) => f.path === this.open);
         this.pick(keep ? keep.path : this.fileOrder()[0] ?? null);
@@ -1464,12 +1465,36 @@ export default class PrDiff extends View {
 
   // `file.tsx:42` (or a path, or a range 42-48) in code spans becomes a link into the diff;
   // fenced code is left alone.
+  // Every file in the repo at the PR's head (once per head), so a name outside the diff can
+  // still become a link: to GitHub, at that commit and line.
+  loadTree() {
+    const sha = this.info?.headRefOid;
+    if (!sha || this.treeSha === sha || this.changes) return;
+    this.treeSha = sha;
+    exec("gh", ["api", `repos/${this.repo}/git/trees/${sha}?recursive=1`, "--jq", '.tree[] | select(.type=="blob") | .path'])
+      .then((r) => { if (r.code === 0) { this.tree = r.stdout.split("\n").filter(Boolean); this.redraw(); } })
+      .catch(() => {});
+  }
+  // A file of the repo outside the diff: its path, when the name is unambiguous.
+  repoFile(name) {
+    const n = String(name).replace(/^\.?\//, "");
+    if (!this.tree) return null;
+    if (this.tree.includes(n)) return n;
+    const tail = this.tree.filter((f) => f.endsWith(`/${n}`));
+    return tail.length === 1 ? tail[0] : null;
+  }
+
   linkFiles(text) {
     if (!this.files?.length || !text) return text;
     return String(text).split(/(\x60\x60\x60[\s\S]*?\x60\x60\x60)/).map((part) => part.startsWith("\x60\x60\x60") ? part
       : part.replace(/(?<!\[)\x60([\w@./-]+\.[A-Za-z0-9]{1,6})(?::(\d+)(?:[-–](\d+))?)?\x60/g, (all, name, line) => {
         const path = this.fileFor(name);
-        return path ? `[${all}](https://herdr-diff.invalid/${encodeURIComponent(path)}?l=${line ?? ""})` : all;
+        if (path) return `[${all}](https://herdr-diff.invalid/${encodeURIComponent(path)}?l=${line ?? ""})`;
+        // Not in this PR: the file as it stands at the PR's head, on GitHub.
+        const other = this.repoFile(name);
+        return other && this.info?.headRefOid
+          ? `[${all}](https://github.com/${this.repo}/blob/${this.info.headRefOid}/${other}${line ? `#L${line}` : ""})`
+          : all;
       })).join("");
   }
 
